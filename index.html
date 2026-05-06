@@ -135,10 +135,12 @@ function mkRoom(id, act, exits, internal, enemies, pickups, type, lock, bg, ws) 
 
 const ROOMS = {
   // 1. Outer perimeter — open, 2 grunts
+  // Spawn room — kept hostile-free so the player has a foothold each
+  // (re)spawn. Pistol pickup remains as the immediate first reward.
   'act1_r01': mkRoom('act1_r01', 1,
     { n: null, s: null, e: 'act1_r02', w: null }, [],
-    [{ type: 'grunt', x: 80, y: 96 }, { type: 'grunt', x: 200, y: 120 }],
-    [{ type: 'pistol', x: 160, y: 140 }], 'combat', true),
+    [],
+    [{ type: 'pistol', x: 160, y: 140 }], 'transition', false),
 
   // 2. Motor pool — humvee cover, 3 grunts + 1 sergeant
   'act1_r02': mkRoom('act1_r02', 1,
@@ -226,11 +228,13 @@ const ROOMS = {
 
   // ── ACT 2 ─────────────────────────────────────────────────────────────────
 
+  // Spawn room for Act 2 — hostile-free foothold; the plasma rifle pickup
+  // remains so the player can rearm after a soft-respawn.
   'act2_r01': mkRoom('act2_r01', 2,
     { n: 'act1_r10', s: 'act2_r02', e: null, w: null },
     [{ x: 108, y: 100, w: 104, h: 12 }],
-    [{ type: 'hybrid', x: 80, y: 60 }, { type: 'hybrid', x: 220, y: 60 }],
-    [{ type: 'plasma_rifle', x: 160, y: 160 }], 'combat', true, PALETTE[8], 'concrete'),
+    [],
+    [{ type: 'plasma_rifle', x: 160, y: 160 }], 'transition', false, PALETTE[8], 'concrete'),
 
   'act2_r02': mkRoom('act2_r02', 2,
     { n: 'act2_r01', s: 'act2_r03', e: null, w: null },
@@ -309,12 +313,13 @@ const ROOMS = {
   // ── ACT 3 ─────────────────────────────────────────────────────────────────
 
   // 1. Vertical shaft — narrow central path, 2 stalkers + 1 spitter
+  // Spawn room for Act 3 — hostile-free foothold. Stalkers + spitter were
+  // moved out so the corridor entry isn't an immediate ambush.
   'act3_r01': mkRoom('act3_r01', 3,
     { w: 'act2_r10', e: 'act3_r02', n: null, s: null },
     [{ x: 8, y: 8,   w: W-16, h: 72 }, { x: 8, y: 160, w: W-16, h: 72 }],
-    [{ type: 'stalker', x: 120, y: 112 }, { type: 'stalker', x: 200, y: 116 },
-     { type: 'spitter', x: 240, y: 112 }],
-    [], 'combat', true, PALETTE[1], 'organic'),
+    [],
+    [], 'transition', false, PALETTE[1], 'organic'),
 
   // 2. Glowing cavern — 3 stalkers + 2 drifters. Heavy laser behind a wall.
   'act3_r02': mkRoom('act3_r02', 3,
@@ -386,13 +391,14 @@ const ROOMS = {
   // Red emergency lighting applied via overlay in RoomManager.draw().
   // All rooms: lockExitsUntilCleared = false — player can run through.
 
+  // Spawn room for Act 4 — hostile-free foothold. Wave spawners that lived
+  // here have been displaced; r02 + r03 still carry the act's spawner load.
   'act4_r01': mkRoom('act4_r01', 4,
     { w: 'act3_r08', e: 'act4_r02', n: null, s: null },
     [{ x: 16, y: 16, w: 40, h: 24 }, { x: 264, y: 16, w: 40, h: 24 },
      { x: 16, y: 200, w: 40, h: 20 }, { x: 264, y: 200, w: 40, h: 20 }],
-    [{ type: 'spawner', x: 80, y: 60 }, { type: 'spawner', x: 240, y: 160 },
-     { type: 'drifter', x: 160, y: 112 }],
-    [], 'combat', false, PALETTE[1], 'organic'),
+    [],
+    [], 'transition', false, PALETTE[1], 'organic'),
 
   'act4_r02': mkRoom('act4_r02', 4,
     { w: 'act4_r01', e: 'act4_r03', n: null, s: null },
