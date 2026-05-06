@@ -64,8 +64,13 @@ const STATE = {
   DYING:          'DYING',
   ACT_TRANSITION: 'ACT_TRANSITION',
   WIN:            'WIN',
-  LOSE:           'LOSE'
+  LOSE:           'LOSE',
+  MANUAL:         'MANUAL'   // in-game field manual (controls / weapons / bestiary)
 };
+
+// Where to return when the player exits the manual.
+let manualReturn = STATE.MENU;
+let manualPage   = 0;
 
 // ===== 2. SPRITE DATA =====
 
@@ -84,6 +89,118 @@ function drawSprite(ctx, data, x, y, scale) {
     }
   }
 }
+
+// --- Cover art (title screen splash) ---
+// Inlined as base64 to preserve the single-file constraint. 240x240 JPEG, ~13 KB.
+// Consumed by titleImg in section 8 (game-loop globals).
+const COVER_DATA_URL =
+  'data:image/jpeg;base64,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';
+// --- In-game field manual ---
+// Each page is a list of lines; '$h' prefix marks a heading, '$d' marks a dim row.
+// Rendered by drawManual() with no markdown or external font dependencies.
+const MANUAL = [
+  {
+    title: 'CONTROLS',
+    lines: [
+      '$hMOVEMENT',
+      '  WASD          move (8-directional)',
+      '  SHIFT         sprint (2 s, 4 s regen)',
+      '$hCOMBAT',
+      '  ARROW KEYS    aim and fire',
+      '  TAB           cycle weapon',
+      '  SPACE         throw grenade',
+      '  R             reload (reserved)',
+      '$hSYSTEM',
+      '  ESC           pause / resume',
+      '  H             open / close manual',
+      '$dHold an arrow key to fire continuously.',
+      '$dFiring direction is independent of movement.'
+    ]
+  },
+  {
+    title: 'WEAPONS',
+    lines: [
+      '$hSTART INVENTORY',
+      '  PULSE RIFLE   1 dmg  4/s   inf ammo',
+      '$hPICKED UP IN-GAME',
+      '  PISTOL        1 dmg  6/s   inf ammo  act 1 r2',
+      '  PLASMA RIFLE  2 dmg  2/s   30 ammo   act 2 r1',
+      '                pierces 1 enemy',
+      '  HEAVY LASER   4 dmg  1/s    8 ammo   act 3 r2',
+      '                instant beam, knockback',
+      '$hTHROWN',
+      '  GRENADE       3 AoE  manual 3 max',
+      '                0.8 s fuse, 32 px blast',
+      '$dWeapons persist across deaths within an act.'
+    ]
+  },
+  {
+    title: 'BESTIARY  1/2',
+    lines: [
+      '$hACT 1  HOSTILE SOLDIERS',
+      '  GRUNT         2 HP  patrols, single shot',
+      '  SERGEANT      3 HP  3-shot bursts, uses cover',
+      '  TWITCHY       2 HP  no gun, charges and rams',
+      '$hACT 2  HYBRIDS AND ALIENS',
+      '  HYBRID SOLDIER 4 HP 2-shot bursts, lunges close',
+      '  ALIEN GRUNT   3 HP  pure melee, fast',
+      '  SPORE DRONE   1 HP  explodes on death,',
+      '                 leaves 3 s spore cloud'
+    ]
+  },
+  {
+    title: 'BESTIARY  2/2',
+    lines: [
+      '$hACT 3  PURE ALIEN',
+      '  STALKER       3 HP  fast, strafes at close',
+      '  SPITTER       4 HP  stationary, arcing acid',
+      '                 acid puddle lasts 2 s',
+      '  DRIFTER       2 HP  passes some walls',
+      '                 slow homing shot',
+      '$hACT 4  ESCAPE WAVES',
+      '  SWARMER       1 HP  spawned in 4-8 waves',
+      '  WAVE SPAWNER  2 HP  destroy to stop waves',
+      '  PURSUER       INV   matches your speed',
+      '                 cannot be killed - just run'
+    ]
+  },
+  {
+    title: 'BOSSES',
+    lines: [
+      '$hACT 1  GENERAL HAYES / THE VESSEL',
+      '  Phase 1 8 HP, 3-shot bursts.',
+      '  At 0 HP: transforms into THE VESSEL,',
+      '   12 HP, charge + ranged spit.',
+      '$hACT 2  BROOD MOTHER',
+      '  Invulnerable while any of 3 nodes alive.',
+      '  Kill all nodes for a 10 s damage window.',
+      '$hACT 3  CORE GUARDIAN',
+      '  Phase 1: shoot the 4 red limbs.',
+      '  Phase 2: dodge sweep beams; summons 2',
+      '   stalkers below 5 HP.',
+      '$hACT 4  THE PURSUER',
+      '  Cannot be killed. Reach the LZ to win.'
+    ]
+  },
+  {
+    title: 'TIPS',
+    lines: [
+      '$hCOMBAT',
+      '  Strafe perpendicular to enemy fire.',
+      '  Sprint resets your facing on release;',
+      '   pivot before shooting.',
+      '  Plasma pierces: line up two enemies.',
+      '  Laser knocks back: use it on chargers.',
+      '$hPACING',
+      '  HP only restores from MED-STIM pickups.',
+      '  Locked rooms unlock when all enemies die.',
+      '  Grenade refills are placed before bosses.',
+      '$hACT 4',
+      '  3:00 timer. Run, do not engage.',
+      '  Spawners drop fast - kill once, move on.'
+    ]
+  }
+];
 
 // ===== 3. ROOM DATA =====
 
@@ -731,7 +848,9 @@ const Input = {
     });
     window.addEventListener('keyup', e => {
       this._held[e.code] = false;
-      this._justDown.delete(e.code);
+      // Don't delete from _justDown here: when keydown and keyup fire inside the
+      // same event-loop tick (synthetic input or extremely fast presses), the
+      // game-loop tick wouldn't see the press at all. consumePressed drains it.
     });
   },
 
@@ -2403,11 +2522,13 @@ let lives         = LIVES_INITIAL;
 let gameStartTime = Date.now();
 
 // Title-screen art (pulpy painted cover; rendered on the MENU state).
+// Source data URL is COVER_DATA_URL near the top of section 2 — keeping the
+// single-file constraint, no external title.png lookup.
 const titleImg = new Image();
 let titleImgLoaded = false;
 titleImg.onload  = () => { titleImgLoaded = true; };
 titleImg.onerror = () => { /* fall back to text-only title */ };
-titleImg.src     = 'title.png';
+titleImg.src     = COVER_DATA_URL;
 
 // Snapshot of every room's original spawn data. Captured once at boot, used
 // to rehydrate ROOMS during a hard reset (after lives run out).
@@ -2544,12 +2665,41 @@ function hardReset(roomId) {
 const ACT_START = { 1:'act1_r01', 2:'act2_r01', 3:'act3_r01', 4:'act4_r01' };
 
 function update(dt) {
-  // MENU → start game on any key
+  // MANUAL → page nav + return
+  if (gameState === STATE.MANUAL) {
+    if (Input.consumePressed('ArrowRight') || Input.consumePressed('KeyD')) {
+      manualPage = (manualPage + 1) % MANUAL.length;
+    }
+    if (Input.consumePressed('ArrowLeft') || Input.consumePressed('KeyA')) {
+      manualPage = (manualPage - 1 + MANUAL.length) % MANUAL.length;
+    }
+    if (Input.consumePressed('KeyH') || Input.consumePressed('Escape')) {
+      gameState = manualReturn;
+    }
+    return;
+  }
+
+  // MENU → H opens manual; any other key starts the game.
   if (gameState === STATE.MENU) {
+    if (Input.consumePressed('KeyH')) {
+      manualReturn = STATE.MENU; manualPage = 0;
+      gameState = STATE.MANUAL;
+      return;
+    }
     if (Input._justDown.size > 0) {
       Input._justDown.clear();
       gameState = STATE.PLAYING;
       Sfx.startAmbient(1);
+    }
+    return;
+  }
+
+  // PAUSED → ESC resumes, H opens manual.
+  if (gameState === STATE.PAUSED) {
+    if (Input.consumePressed('Escape')) gameState = STATE.PLAYING;
+    if (Input.consumePressed('KeyH')) {
+      manualReturn = STATE.PAUSED; manualPage = 0;
+      gameState = STATE.MANUAL;
     }
     return;
   }
@@ -2570,6 +2720,14 @@ function update(dt) {
       if (lives > 0) softRespawn();
       else           hardReset(startId);
     }
+    return;
+  }
+
+  // PLAYING: ESC pauses, H opens manual without losing place.
+  if (Input.consumePressed('Escape')) { gameState = STATE.PAUSED; return; }
+  if (Input.consumePressed('KeyH')) {
+    manualReturn = STATE.PAUSED; manualPage = 0;
+    gameState = STATE.MANUAL;
     return;
   }
 
@@ -2732,10 +2890,15 @@ function render(ctx) {
     if (Math.floor(Date.now() / 600) % 2 === 0) {
       // Subtle drop-shadow keeps the text legible against the painted art.
       ctx.fillStyle = PALETTE[0];
-      ctx.fillText('PRESS ANY KEY TO START', W/2 + 1, H - 11);
+      ctx.fillText('PRESS ANY KEY TO START', W/2 + 1, H - 21);
       ctx.fillStyle = PALETTE[15];
-      ctx.fillText('PRESS ANY KEY TO START', W/2,     H - 12);
+      ctx.fillText('PRESS ANY KEY TO START', W/2,     H - 22);
     }
+    // Persistent manual hint.
+    ctx.fillStyle = PALETTE[0];
+    ctx.fillText('PRESS H FOR FIELD MANUAL', W/2 + 1, H - 9);
+    ctx.fillStyle = PALETTE[12];
+    ctx.fillText('PRESS H FOR FIELD MANUAL', W/2,     H - 10);
     ctx.textAlign = 'left'; return;
   }
 
@@ -2762,6 +2925,33 @@ function render(ctx) {
     ctx.textAlign = 'left'; return;
   }
 
+  if (gameState === STATE.MANUAL) { drawManual(ctx); return; }
+
+  if (gameState === STATE.PAUSED) {
+    // Render the world frozen behind a dim overlay so the player keeps context.
+    RoomManager.draw(ctx);
+    for (const ap of acidPuddles)  ap.draw(ctx);
+    for (const sc of sporeClouds)  sc.draw(ctx);
+    for (const pp of pulsePillars) pp.draw(ctx);
+    for (const p  of livePickups)  p.draw(ctx);
+    for (const e  of enemies)      e.draw(ctx);
+    for (const g  of grenadeList)  g.draw(ctx);
+    for (const b  of bullets)      b.draw(ctx);
+    for (const bm of beams)        bm.draw(ctx);
+    for (const ss of spitterSpits) ss.draw(ctx);
+    for (const p  of particles)    p.draw(ctx);
+    for (const sw of shockwaves)   sw.draw(ctx);
+    for (const sb of sweepBeams)   sb.draw(ctx);
+    player.draw(ctx);
+    drawHUD(ctx);
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillRect(0, 0, W, H);
+    ctx.font = '8px monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = PALETTE[12]; ctx.fillText('PAUSED', W/2, H/2 - 8);
+    ctx.fillStyle = PALETTE[5];
+    ctx.fillText('ESC resume   H field manual', W/2, H/2 + 6);
+    ctx.textAlign = 'left'; return;
+  }
+
   RoomManager.draw(ctx);
   for (const ap of acidPuddles)  ap.draw(ctx);
   for (const sc of sporeClouds)  sc.draw(ctx);
@@ -2777,6 +2967,39 @@ function render(ctx) {
   for (const sb of sweepBeams)   sb.draw(ctx);
   player.draw(ctx);
   drawHUD(ctx);
+}
+
+// Render one page of the in-game field manual at the canvas's native resolution.
+// Lines starting with '$h' are headings (yellow), '$d' are dim notes (mid grey).
+function drawManual(ctx) {
+  const page = MANUAL[manualPage];
+  ctx.fillStyle = PALETTE[1]; ctx.fillRect(0, 0, W, H);
+  ctx.font = '8px monospace';
+
+  // Header: title + page indicator
+  ctx.textAlign = 'center';
+  ctx.fillStyle = PALETTE[12];
+  ctx.fillText('FIELD MANUAL  -  ' + page.title, W/2, 14);
+  ctx.fillStyle = PALETTE[4];
+  ctx.fillText('PAGE ' + (manualPage + 1) + '/' + MANUAL.length, W/2, 24);
+
+  // Body: top-aligned, left-flushed, ~10px line-height keeps 22-row pages legible.
+  ctx.textAlign = 'left';
+  let y = 42;
+  for (const raw of page.lines) {
+    let line = raw, color = PALETTE[5];
+    if      (raw.startsWith('$h')) { line = raw.slice(2); color = PALETTE[12]; }
+    else if (raw.startsWith('$d')) { line = raw.slice(2); color = PALETTE[4];  }
+    ctx.fillStyle = color;
+    ctx.fillText(line, 12, y);
+    y += 10;
+  }
+
+  // Footer hint (centered, dim)
+  ctx.textAlign = 'center';
+  ctx.fillStyle = PALETTE[4];
+  ctx.fillText('< / >  page    ESC or H  back', W/2, H - 8);
+  ctx.textAlign = 'left';
 }
 
 function loop(ts) {
