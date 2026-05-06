@@ -1,0 +1,2832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HOSTFALL</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+    #display {
+      display: block;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+<canvas id="display"></canvas>
+<script>
+
+// ===== 1. CONSTANTS =====
+
+const W  = 320;
+const H  = 240;
+const DT = 1 / 60;   // fixed timestep
+const BW        = 8;  // border-wall thickness
+const DOOR_SIZE = 32; // doorway opening width/height
+
+const PALETTE = [
+  '#000000', // 0  black
+  '#1a1a2e', // 1  deep navy
+  '#16213e', // 2  dark blue
+  '#3a2e1a', // 3  dark brown
+  '#7a7a7a', // 4  grey concrete
+  '#c8c8c8', // 5  light grey
+  '#5a3a1a', // 6  brown
+  '#8b6914', // 7  khaki
+  '#2d5016', // 8  dark green
+  '#7fb069', // 9  glow green
+  '#d62828', // 10 blood red
+  '#f77f00', // 11 orange
+  '#fcbf49', // 12 yellow
+  '#7209b7', // 13 purple
+  '#f72585', // 14 magenta
+  '#ffffff'  // 15 white
+];
+
+const STATE = {
+  MENU:           'MENU',
+  PLAYING:        'PLAYING',
+  PAUSED:         'PAUSED',
+  DYING:          'DYING',
+  ACT_TRANSITION: 'ACT_TRANSITION',
+  WIN:            'WIN',
+  LOSE:           'LOSE'
+};
+
+// ===== 2. SPRITE DATA =====
+
+// Sprites are 2D arrays of palette indices; -1 = transparent.
+// drawSprite renders each cell as (scale × scale) pixels.
+const SPR = {};
+
+function drawSprite(ctx, data, x, y, scale) {
+  scale = scale || 1;
+  for (let r = 0; r < data.length; r++) {
+    for (let c = 0; c < data[r].length; c++) {
+      const idx = data[r][c];
+      if (idx < 0) continue;
+      ctx.fillStyle = PALETTE[idx];
+      ctx.fillRect(Math.round(x + c * scale), Math.round(y + r * scale), scale, scale);
+    }
+  }
+}
+
+// ===== 3. ROOM DATA =====
+
+// Build border walls with doorway gaps where exits exist.
+// Doors are centred horizontally (N/S) or vertically (E/W).
+function buildWalls(exits) {
+  const DS = DOOR_SIZE;
+  const w  = [];
+  const hgap = [W / 2 - DS / 2, DS]; // [start, width] of horizontal gap
+  const vgap = [H / 2 - DS / 2, DS]; // [start, height] of vertical gap
+
+  // Top
+  if (exits.n) {
+    w.push({ x: 0,              y: 0,      w: hgap[0],             h: BW });
+    w.push({ x: hgap[0] + DS,   y: 0,      w: W - hgap[0] - DS,    h: BW });
+  } else { w.push({ x: 0, y: 0, w: W, h: BW }); }
+
+  // Bottom
+  if (exits.s) {
+    w.push({ x: 0,              y: H - BW, w: hgap[0],             h: BW });
+    w.push({ x: hgap[0] + DS,   y: H - BW, w: W - hgap[0] - DS,    h: BW });
+  } else { w.push({ x: 0, y: H - BW, w: W, h: BW }); }
+
+  // Left
+  if (exits.w) {
+    w.push({ x: 0, y: 0,              w: BW, h: vgap[0]          });
+    w.push({ x: 0, y: vgap[0] + DS,   w: BW, h: H - vgap[0] - DS });
+  } else { w.push({ x: 0, y: 0, w: BW, h: H }); }
+
+  // Right
+  if (exits.e) {
+    w.push({ x: W - BW, y: 0,              w: BW, h: vgap[0]          });
+    w.push({ x: W - BW, y: vgap[0] + DS,   w: BW, h: H - vgap[0] - DS });
+  } else { w.push({ x: W - BW, y: 0, w: BW, h: H }); }
+
+  return w;
+}
+
+function mkRoom(id, act, exits, internal, enemies, pickups, type, lock, bg, ws) {
+  return {
+    id, act, exits,
+    get walls() { return [...buildWalls(this.exits), ...internal]; },
+    enemies, pickups,
+    cleared: false, type: type || 'combat',
+    lockExitsUntilCleared: lock !== false,
+    bgColor: bg || PALETTE[3], wallStyle: ws || 'concrete'
+  };
+}
+
+const ROOMS = {
+  // 1. Outer perimeter — open, 2 grunts
+  'act1_r01': mkRoom('act1_r01', 1,
+    { n: null, s: null, e: 'act1_r02', w: null }, [],
+    [{ type: 'grunt', x: 80, y: 96 }, { type: 'grunt', x: 200, y: 120 }],
+    [{ type: 'pistol', x: 160, y: 140 }], 'combat', true),
+
+  // 2. Motor pool — humvee cover, 3 grunts + 1 sergeant
+  'act1_r02': mkRoom('act1_r02', 1,
+    { n: null, s: null, e: 'act1_r03', w: 'act1_r01' },
+    [{ x: 48,  y: 76, w: 72, h: 18 },   // humvee L
+     { x: 196, y: 140, w: 72, h: 18 }], // humvee R
+    [{ type: 'grunt',    x: 56,  y: 140 },
+     { type: 'grunt',    x: 160, y: 56  },
+     { type: 'grunt',    x: 260, y: 160 },
+     { type: 'sergeant', x: 148, y: 108 }],
+    [], 'combat', true),
+
+  // 3. Guard post — chokepoint wall, 2 grunts
+  'act1_r03': mkRoom('act1_r03', 1,
+    { n: null, s: null, e: 'act1_r04', w: 'act1_r02' },
+    [{ x: 136, y: 8,  w: 16, h: 84  },   // top gate post
+     { x: 136, y: 148, w: 16, h: 84 }],  // bottom gate post
+    [{ type: 'grunt', x: 200, y: 80 }, { type: 'grunt', x: 200, y: 148 }],
+    [], 'combat', true),
+
+  // 4. Main hallway — pillars, 4 grunts, med-stim
+  'act1_r04': mkRoom('act1_r04', 1,
+    { n: null, s: 'act1_r05', e: null, w: 'act1_r03' },
+    [{ x: 96,  y: 56, w: 12, h: 36 }, { x: 96,  y: 148, w: 12, h: 36 },
+     { x: 212, y: 56, w: 12, h: 36 }, { x: 212, y: 148, w: 12, h: 36 }],
+    [{ type: 'grunt', x: 56,  y: 60  }, { type: 'grunt', x: 56,  y: 160 },
+     { type: 'grunt', x: 240, y: 60  }, { type: 'grunt', x: 240, y: 160 }],
+    [{ type: 'medstim', x: 154, y: 114 }], 'combat', true),
+
+  // 5. Mess hall — tables, 2 sergeants + 2 grunts
+  'act1_r05': mkRoom('act1_r05', 1,
+    { n: 'act1_r04', s: 'act1_r06', e: null, w: null },
+    [{ x: 48,  y: 64, w: 56, h: 12 },
+     { x: 48,  y: 148, w: 56, h: 12 },
+     { x: 216, y: 96, w: 56, h: 12 }],
+    [{ type: 'sergeant', x: 80,  y: 104 }, { type: 'sergeant', x: 220, y: 136 },
+     { type: 'grunt',    x: 152, y: 64  }, { type: 'grunt',    x: 152, y: 160 }],
+    [], 'combat', true),
+
+  // 6. Barracks — bunks, 3 grunts + 1 twitchy
+  'act1_r06': mkRoom('act1_r06', 1,
+    { n: 'act1_r05', s: null, e: 'act1_r07', w: null },
+    [{ x: 16, y: 52,  w: 32, h: 12 }, { x: 16, y: 96,  w: 32, h: 12 },
+     { x: 16, y: 140, w: 32, h: 12 },
+     { x: 272, y: 32,  w: 32, h: 12 }, { x: 272, y: 172, w: 32, h: 12 }],
+    [{ type: 'grunt',   x: 80,  y: 60  }, { type: 'grunt',   x: 80,  y: 148 },
+     { type: 'grunt',   x: 200, y: 100 }, { type: 'twitchy', x: 220, y: 148 }],
+    [], 'combat', true),
+
+  // 7. Armory — crates, 2 sergeants, grenade + ammo pickups
+  'act1_r07': mkRoom('act1_r07', 1,
+    { n: null, s: null, e: 'act1_r08', w: 'act1_r06' },
+    [{ x: 100, y: 68,  w: 24, h: 24 }, { x: 100, y: 148, w: 24, h: 24 },
+     { x: 196, y: 96,  w: 24, h: 24 }],
+    [{ type: 'sergeant', x: 60,  y: 60  }, { type: 'sergeant', x: 60,  y: 160 }],
+    [{ type: 'grenade', x: 200, y: 64 }, { type: 'ammo_plasma', x: 244, y: 160 }],
+    'combat', true),
+
+  // 8. Communications room — terminals, 1 sergeant + 2 twitchy
+  'act1_r08': mkRoom('act1_r08', 1,
+    { n: null, s: null, e: 'act1_r09', w: 'act1_r07' },
+    [{ x: 56,  y: 36,  w: 20, h: 28 }, { x: 56,  y: 164, w: 20, h: 28 },
+     { x: 244, y: 36,  w: 20, h: 28 }, { x: 244, y: 164, w: 20, h: 28 }],
+    [{ type: 'sergeant', x: 160, y: 104 },
+     { type: 'twitchy',  x: 120, y: 64  }, { type: 'twitchy', x: 120, y: 164 }],
+    [], 'combat', true),
+
+  // 9. Command corridor — final approach, 2 sergeants + grunt, med-stim
+  'act1_r09': mkRoom('act1_r09', 1,
+    { n: null, s: null, e: 'act1_r10', w: 'act1_r08' },
+    [{ x: 124, y: 68, w: 12, h: 20 }, { x: 184, y: 148, w: 12, h: 20 }],
+    [{ type: 'sergeant', x: 80,  y: 84  }, { type: 'sergeant', x: 240, y: 148 },
+     { type: 'grunt',    x: 160, y: 112 }],
+    [{ type: 'medstim', x: 154, y: 68 }], 'combat', true),
+
+  // 10. Command center — boss arena, corner desks
+  'act1_r10': mkRoom('act1_r10', 1,
+    { n: null, s: 'act2_r01', e: null, w: 'act1_r09' },
+    [{ x: 16,  y: 20,  w: 40, h: 20 }, // desk TL
+     { x: 264, y: 20,  w: 40, h: 20 }, // desk TR
+     { x: 16,  y: 196, w: 40, h: 20 }, // desk BL
+     { x: 264, y: 196, w: 40, h: 20 }], // desk BR
+    [{ type: 'hayes_boss', x: 144, y: 96 }],
+    [], 'boss', false, PALETTE[2], 'metal'),
+
+  // ── ACT 2 ─────────────────────────────────────────────────────────────────
+
+  'act2_r01': mkRoom('act2_r01', 2,
+    { n: 'act1_r10', s: 'act2_r02', e: null, w: null },
+    [{ x: 108, y: 100, w: 104, h: 12 }],
+    [{ type: 'hybrid', x: 80, y: 60 }, { type: 'hybrid', x: 220, y: 60 }],
+    [{ type: 'plasma_rifle', x: 160, y: 160 }], 'combat', true, PALETTE[8], 'concrete'),
+
+  'act2_r02': mkRoom('act2_r02', 2,
+    { n: 'act2_r01', s: 'act2_r03', e: null, w: null },
+    [{ x: 48, y: 80, w: 80, h: 12 }, { x: 192, y: 140, w: 80, h: 12 }],
+    [{ type: 'hybrid', x: 80,  y: 60  }, { type: 'hybrid', x: 160, y: 120 },
+     { type: 'hybrid', x: 220, y: 160 }],
+    [], 'combat', true, PALETTE[8], 'organic'),
+
+  'act2_r03': mkRoom('act2_r03', 2,
+    { n: 'act2_r02', s: 'act2_r04', e: null, w: null },
+    [{ x: 56, y: 56, w: 40, h: 24 }, { x: 220, y: 56, w: 40, h: 24 },
+     { x: 130, y: 140, w: 60, h: 16 }],
+    [{ type: 'alien_grunt', x: 80,  y: 140 }, { type: 'alien_grunt', x: 200, y: 100 }],
+    [], 'story', false, PALETTE[8], 'organic'),
+
+  'act2_r04': mkRoom('act2_r04', 2,
+    { n: 'act2_r03', s: 'act2_r05', e: null, w: null },
+    [{ x: 16, y: 52,  w: 32, h: 12 }, { x: 16, y: 96,  w: 32, h: 12 },
+     { x: 16, y: 140, w: 32, h: 12 }, { x: 272, y: 32,  w: 32, h: 12 },
+     { x: 272, y: 172, w: 32, h: 12 }],
+    [{ type: 'alien_grunt', x: 80,  y: 60  }, { type: 'alien_grunt', x: 200, y: 60  },
+     { type: 'alien_grunt', x: 80,  y: 160 }, { type: 'alien_grunt', x: 200, y: 160 }],
+    [], 'combat', true, PALETTE[8], 'organic'),
+
+  'act2_r05': mkRoom('act2_r05', 2,
+    { n: 'act2_r04', e: 'act2_r06', s: null, w: null },
+    [{ x: 64, y: 80, w: 32, h: 32 }, { x: 208, y: 120, w: 32, h: 32 }],
+    [{ type: 'spore_drone', x: 80,  y: 60  }, { type: 'spore_drone', x: 160, y: 120 },
+     { type: 'spore_drone', x: 240, y: 60  },
+     { type: 'alien_grunt', x: 120, y: 160 }, { type: 'alien_grunt', x: 200, y: 80  }],
+    [], 'combat', true, PALETTE[8], 'organic'),
+
+  'act2_r06': mkRoom('act2_r06', 2,
+    { w: 'act2_r05', e: 'act2_r07', n: null, s: null },
+    [{ x: 60, y: 40,  w: 20, h: 60 }, { x: 60,  y: 140, w: 20, h: 60 },
+     { x: 240, y: 40,  w: 20, h: 60 }, { x: 240, y: 140, w: 20, h: 60 }],
+    [{ type: 'hybrid',     x: 100, y: 100 }, { type: 'hybrid',      x: 200, y: 100 },
+     { type: 'spore_drone', x: 80, y: 112 }, { type: 'spore_drone', x: 236, y: 112 }],
+    [], 'combat', true, PALETTE[8], 'metal'),
+
+  'act2_r07': mkRoom('act2_r07', 2,
+    { w: 'act2_r06', e: 'act2_r08', n: null, s: null },
+    [{ x: 8, y: 8,   w: W - 16, h: 88 },  // top chasm wall
+     { x: 8, y: 148, w: W - 16, h: 84 }], // bottom chasm wall
+    [{ type: 'hybrid', x: 80,  y: 112 }, { type: 'hybrid', x: 140, y: 112 },
+     { type: 'hybrid', x: 190, y: 112 }, { type: 'hybrid', x: 240, y: 112 }],
+    [], 'combat', true, PALETTE[1], 'organic'),
+
+  'act2_r08': mkRoom('act2_r08', 2,
+    { w: 'act2_r07', e: 'act2_r09', n: null, s: null },
+    [{ x: 60, y: 40, w: 24, h: 24 }, { x: 60,  y: 168, w: 24, h: 24 },
+     { x: 200, y: 40, w: 24, h: 24 }, { x: 200, y: 168, w: 24, h: 24 }],
+    [{ type: 'sergeant',    x: 100, y: 100 }, { type: 'sergeant',    x: 200, y: 140 },
+     { type: 'alien_grunt', x: 60,  y: 56  }, { type: 'alien_grunt', x: 240, y: 60  },
+     { type: 'spore_drone', x: 80,  y: 160 }, { type: 'spore_drone', x: 160, y: 56  },
+     { type: 'spore_drone', x: 220, y: 160 }, { type: 'spore_drone', x: 160, y: 160 }],
+    [], 'combat', true, PALETTE[8], 'concrete'),
+
+  'act2_r09': mkRoom('act2_r09', 2,
+    { w: 'act2_r08', e: 'act2_r10', n: null, s: null },
+    [{ x: 120, y: 72, w: 12, h: 20 }, { x: 188, y: 144, w: 12, h: 20 }],
+    [{ type: 'alien_grunt', x: 80,  y: 80  },
+     { type: 'alien_grunt', x: 160, y: 140 },
+     { type: 'alien_grunt', x: 240, y: 80  }],
+    [{ type: 'ammo_plasma', x: 160, y: 110 }, { type: 'medstim', x: 220, y: 110 }],
+    'combat', true, PALETTE[8], 'organic'),
+
+  'act2_r10': mkRoom('act2_r10', 2,
+    { w: 'act2_r09', n: null, s: null, e: 'act3_r01' },
+    [{ x: 16,  y: 16,  w: 48, h: 24 },
+     { x: 256, y: 16,  w: 48, h: 24 },
+     { x: 128, y: 196, w: 64, h: 20 }],
+    [{ type: 'brood_mother', x: 140, y: 100 }],
+    [], 'boss', false, PALETTE[1], 'organic'),
+
+  // ── ACT 3 ─────────────────────────────────────────────────────────────────
+
+  // 1. Vertical shaft — narrow central path, 2 stalkers + 1 spitter
+  'act3_r01': mkRoom('act3_r01', 3,
+    { w: 'act2_r10', e: 'act3_r02', n: null, s: null },
+    [{ x: 8, y: 8,   w: W-16, h: 72 }, { x: 8, y: 160, w: W-16, h: 72 }],
+    [{ type: 'stalker', x: 120, y: 112 }, { type: 'stalker', x: 200, y: 116 },
+     { type: 'spitter', x: 240, y: 112 }],
+    [], 'combat', true, PALETTE[1], 'organic'),
+
+  // 2. Glowing cavern — 3 stalkers + 2 drifters. Heavy laser behind a wall.
+  'act3_r02': mkRoom('act3_r02', 3,
+    { w: 'act3_r01', e: 'act3_r03', n: null, s: null },
+    [{ x: 200, y: 72, w: 12, h: 80 }],
+    [{ type: 'stalker', x: 80,  y: 80  }, { type: 'stalker', x: 80,  y: 148 },
+     { type: 'stalker', x: 240, y: 112 },
+     { type: 'drifter', x: 160, y: 56  }, { type: 'drifter', x: 160, y: 168 }],
+    [{ type: 'heavy_laser', x: 248, y: 120 }], 'combat', true, PALETTE[1], 'organic'),
+
+  // 3. Spore corridor — 4 spore drones + 2 spitters
+  'act3_r03': mkRoom('act3_r03', 3,
+    { w: 'act3_r02', e: 'act3_r04', n: null, s: null },
+    [{ x: 80,  y: 8,   w: 16, h: 80 }, { x: 80,  y: 152, w: 16, h: 80 },
+     { x: 224, y: 8,   w: 16, h: 80 }, { x: 224, y: 152, w: 16, h: 80 }],
+    [{ type: 'spore_drone', x: 120, y: 60  }, { type: 'spore_drone', x: 160, y: 120 },
+     { type: 'spore_drone', x: 200, y: 60  }, { type: 'spore_drone', x: 140, y: 160 },
+     { type: 'spitter',     x: 64,  y: 112 }, { type: 'spitter',     x: 248, y: 112 }],
+    [], 'combat', true, PALETTE[1], 'organic'),
+
+  // 4. Pulse chamber — 2 stalkers + 4 pulsing pillars (in enemies list for spawn)
+  'act3_r04': mkRoom('act3_r04', 3,
+    { w: 'act3_r03', e: 'act3_r05', n: null, s: null },
+    [{ x: 96,  y: 88,  w: 16, h: 16 }, { x: 208, y: 88,  w: 16, h: 16 },
+     { x: 96,  y: 136, w: 16, h: 16 }, { x: 208, y: 136, w: 16, h: 16 }],
+    [{ type: 'stalker',      x: 60,  y: 60  }, { type: 'stalker',      x: 240, y: 160 },
+     { type: 'pulse_pillar', x: 96,  y: 88  }, { type: 'pulse_pillar', x: 208, y: 88  },
+     { type: 'pulse_pillar', x: 96,  y: 136 }, { type: 'pulse_pillar', x: 208, y: 136 }],
+    [], 'combat', true, PALETTE[1], 'organic'),
+
+  // 5. Bridge over the abyss — 3 drifters + 1 stalker. Narrow platform.
+  'act3_r05': mkRoom('act3_r05', 3,
+    { w: 'act3_r04', e: 'act3_r06', n: null, s: null },
+    [{ x: 8, y: 8,   w: W-16, h: 72 }, { x: 8, y: 160, w: W-16, h: 72 }],
+    [{ type: 'drifter', x: 80,  y: 112 }, { type: 'drifter', x: 160, y: 112 },
+     { type: 'drifter', x: 240, y: 112 }, { type: 'stalker',  x: 200, y: 116 }],
+    [], 'combat', true, PALETTE[1], 'organic'),
+
+  // 6. Hive corridor — 2 spitters + 4 spore drones + 1 stalker (density spike)
+  'act3_r06': mkRoom('act3_r06', 3,
+    { w: 'act3_r05', e: 'act3_r07', n: null, s: null },
+    [{ x: 56,  y: 40,  w: 20, h: 56 }, { x: 56,  y: 144, w: 20, h: 48 },
+     { x: 244, y: 40,  w: 20, h: 56 }, { x: 244, y: 144, w: 20, h: 48 }],
+    [{ type: 'spitter',     x: 60,  y: 112 }, { type: 'spitter',     x: 252, y: 112 },
+     { type: 'spore_drone', x: 100, y: 60  }, { type: 'spore_drone', x: 200, y: 60  },
+     { type: 'spore_drone', x: 100, y: 160 }, { type: 'spore_drone', x: 200, y: 160 },
+     { type: 'stalker',     x: 160, y: 112 }],
+    [], 'combat', true, PALETTE[1], 'organic'),
+
+  // 7. Hazard gauntlet — no combat enemies, med-stim + laser ammo
+  'act3_r07': mkRoom('act3_r07', 3,
+    { w: 'act3_r06', e: 'act3_r08', n: null, s: null },
+    [{ x: 80,  y: 80,  w: 24, h: 24 }, { x: 200, y: 136, w: 24, h: 24 }],
+    [{ type: 'spore_drone', x: 80,  y: 80  },
+     { type: 'spore_drone', x: 200, y: 80  },
+     { type: 'spore_drone', x: 140, y: 160 }],
+    [{ type: 'medstim',    x: 160, y: 112 },
+     { type: 'ammo_laser', x: 200, y: 112 }], 'story', false, PALETTE[1], 'organic'),
+
+  // 8. Core chamber — boss arena, 4 corner pillars
+  'act3_r08': mkRoom('act3_r08', 3,
+    { w: 'act3_r07', e: 'act4_r01', n: null, s: null },
+    [{ x: 16,  y: 16,  w: 40, h: 24 }, { x: 264, y: 16,  w: 40, h: 24 },
+     { x: 16,  y: 200, w: 40, h: 20 }, { x: 264, y: 200, w: 40, h: 20 }],
+    [{ type: 'core_guardian', x: 136, y: 96 }],
+    [], 'boss', false, PALETTE[1], 'organic'),
+
+  // ── ACT 4 (Escape) ────────────────────────────────────────────────────────
+  // Red emergency lighting applied via overlay in RoomManager.draw().
+  // All rooms: lockExitsUntilCleared = false — player can run through.
+
+  'act4_r01': mkRoom('act4_r01', 4,
+    { w: 'act3_r08', e: 'act4_r02', n: null, s: null },
+    [{ x: 16, y: 16, w: 40, h: 24 }, { x: 264, y: 16, w: 40, h: 24 },
+     { x: 16, y: 200, w: 40, h: 20 }, { x: 264, y: 200, w: 40, h: 20 }],
+    [{ type: 'spawner', x: 80, y: 60 }, { type: 'spawner', x: 240, y: 160 },
+     { type: 'drifter', x: 160, y: 112 }],
+    [], 'combat', false, PALETTE[1], 'organic'),
+
+  'act4_r02': mkRoom('act4_r02', 4,
+    { w: 'act4_r01', e: 'act4_r03', n: null, s: null },
+    [{ x: 56, y: 40, w: 20, h: 56 }, { x: 56, y: 144, w: 20, h: 48 },
+     { x: 244, y: 40, w: 20, h: 56 }, { x: 244, y: 144, w: 20, h: 48 }],
+    [{ type: 'spawner', x: 80, y: 60 }, { type: 'spawner', x: 240, y: 60 },
+     { type: 'spawner', x: 160, y: 160 },
+     { type: 'spore_drone', x: 120, y: 112 }],
+    [], 'combat', false, PALETTE[1], 'organic'),
+
+  'act4_r03': mkRoom('act4_r03', 4,
+    { w: 'act4_r02', e: 'act4_r04', n: null, s: null },
+    [{ x: 200, y: 72, w: 12, h: 80 }],
+    [{ type: 'spawner', x: 80, y: 100 },
+     { type: 'stalker', x: 160, y: 60 }, { type: 'stalker', x: 240, y: 160 }],
+    [], 'combat', false, PALETTE[1], 'organic'),
+
+  'act4_r04': mkRoom('act4_r04', 4,
+    { w: 'act4_r03', e: 'act4_r05', n: null, s: null }, [],
+    [{ type: 'swarmer', x: 80, y: 100 }, { type: 'swarmer', x: 200, y: 120 },
+     { type: 'alien_grunt', x: 160, y: 80 }],
+    [], 'combat', false, PALETTE[1], 'organic'),
+
+  'act4_r05': mkRoom('act4_r05', 4,
+    { w: 'act4_r04', e: 'act4_r06', n: null, s: null },
+    [{ x: 8, y: 8, w: W-16, h: 72 }, { x: 8, y: 160, w: W-16, h: 72 }],
+    [{ type: 'spawner', x: 80, y: 112 }, { type: 'spawner', x: 200, y: 112 },
+     { type: 'swarmer', x: 140, y: 112 }],
+    [], 'combat', false, PALETTE[1], 'organic'),
+
+  'act4_r06': mkRoom('act4_r06', 4,
+    { w: 'act4_r05', e: 'act4_r07', n: null, s: null },
+    [{ x: 48, y: 76, w: 72, h: 18 }, { x: 196, y: 140, w: 72, h: 18 }],
+    [{ type: 'spawner', x: 60, y: 60 }, { type: 'spawner', x: 240, y: 160 },
+     { type: 'hybrid', x: 120, y: 100 }, { type: 'hybrid', x: 200, y: 100 }],
+    [], 'combat', false, PALETTE[2], 'concrete'),
+
+  'act4_r07': mkRoom('act4_r07', 4,
+    { w: 'act4_r06', e: 'act4_r08', n: null, s: null },
+    [{ x: 96, y: 56, w: 12, h: 36 }, { x: 96, y: 148, w: 12, h: 36 },
+     { x: 212, y: 56, w: 12, h: 36 }, { x: 212, y: 148, w: 12, h: 36 }],
+    [{ type: 'spawner', x: 60,  y: 60  }, { type: 'spawner', x: 240, y: 60  },
+     { type: 'spawner', x: 160, y: 160 },
+     { type: 'pursuer', x: 20,  y: H/2 - 12 }],
+    [], 'combat', false, PALETTE[3], 'concrete'),
+
+  'act4_r08': mkRoom('act4_r08', 4,
+    { w: 'act4_r07', e: null, n: null, s: null }, [],
+    [{ type: 'swarmer', x: 80,  y: 100 }, { type: 'swarmer', x: 160, y: 80  },
+     { type: 'swarmer', x: 200, y: 130 }],
+    [], 'combat', false, PALETTE[3], 'concrete')
+};
+
+// ===== 4. AUDIO SYSTEM =====
+
+const Sfx = {
+  ctx: null,
+
+  // Call on first keydown (AudioContext requires a user gesture).
+  _boot() {
+    if (this.ctx) return;
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  },
+
+  // Short white-noise buffer of given duration (seconds).
+  _noise(dur) {
+    const sr  = this.ctx.sampleRate;
+    const len = Math.ceil(sr * dur);
+    const buf = this.ctx.createBuffer(1, len, sr);
+    const d   = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  },
+
+  // Connect a chain of nodes (array) and play from t for dur seconds.
+  _play(nodes, t, dur) {
+    for (let i = 0; i < nodes.length - 1; i++) nodes[i].connect(nodes[i + 1]);
+    nodes[nodes.length - 1].connect(this.ctx.destination);
+    const src = nodes[0];
+    src.start(t);
+    if (dur) src.stop(t + dur + 0.01);
+  },
+
+  // Pulse rifle shot: square 880→220 Hz / 0.06 s, gain 0.3→0
+  shot() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t    = ctx.currentTime;
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(880, t);
+    osc.frequency.exponentialRampToValueAtTime(220, t + 0.06);
+    gain.gain.setValueAtTime(0.3, t);
+    gain.gain.linearRampToValueAtTime(0, t + 0.06);
+    this._play([osc, gain], t, 0.06);
+  },
+
+  // Enemy hit: noise burst 0.05 s, high-pass 2000 Hz
+  enemyHit() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t    = ctx.currentTime;
+    const src  = ctx.createBufferSource();
+    src.buffer = this._noise(0.05);
+    const hp   = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 2000;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.5, t);
+    gain.gain.linearRampToValueAtTime(0, t + 0.05);
+    this._play([src, hp, gain], t);
+  },
+
+  // Enemy death: noise burst 0.2 s, low-pass sweeping 1500→100 Hz
+  enemyDie() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t    = ctx.currentTime;
+    const src  = ctx.createBufferSource();
+    src.buffer = this._noise(0.2);
+    const lp   = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(1500, t);
+    lp.frequency.exponentialRampToValueAtTime(80, t + 0.2);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.6, t);
+    gain.gain.linearRampToValueAtTime(0, t + 0.2);
+    this._play([src, lp, gain], t);
+  },
+
+  // Player hit: square 110 Hz, 0.15 s, detune wobble
+  playerHit() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t    = ctx.currentTime;
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'square'; osc.frequency.value = 110;
+    osc.detune.setValueAtTime(0,   t);
+    osc.detune.linearRampToValueAtTime( 60, t + 0.05);
+    osc.detune.linearRampToValueAtTime(-60, t + 0.10);
+    osc.detune.linearRampToValueAtTime(  0, t + 0.15);
+    gain.gain.setValueAtTime(0.5, t);
+    gain.gain.linearRampToValueAtTime(0, t + 0.15);
+    this._play([osc, gain], t, 0.15);
+  },
+
+  // Pickup: sine 660→990 Hz blip
+  pickup() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t    = ctx.currentTime;
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(660, t);
+    osc.frequency.linearRampToValueAtTime(990, t + 0.1);
+    gain.gain.setValueAtTime(0.35, t);
+    gain.gain.linearRampToValueAtTime(0,   t + 0.1);
+    this._play([osc, gain], t, 0.1);
+  },
+
+  // Door unlock: two rising sine blips (440 then 660 Hz)
+  doorOpen() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t = ctx.currentTime;
+    [440, 660].forEach((freq, i) => {
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine'; osc.frequency.value = freq;
+      const s = t + i * 0.09;
+      gain.gain.setValueAtTime(0.3,  s);
+      gain.gain.linearRampToValueAtTime(0, s + 0.08);
+      this._play([osc, gain], s, 0.08);
+    });
+  },
+
+  // Boss phase transition: low rumble (sine 60 Hz) + reverse cymbal (noise rising)
+  bossTransition() {
+    if (!this.ctx) return;
+    const { ctx } = this;
+    const t = ctx.currentTime;
+    // Low rumble
+    const osc  = ctx.createOscillator();
+    const rGain = ctx.createGain();
+    osc.type = 'sine'; osc.frequency.value = 60;
+    rGain.gain.setValueAtTime(0.7, t);
+    rGain.gain.linearRampToValueAtTime(0, t + 1.0);
+    this._play([osc, rGain], t, 1.0);
+    // Reverse cymbal: noise with bandpass sweeping up
+    const src = ctx.createBufferSource();
+    src.buffer = this._noise(1.0);
+    const bp   = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(200, t);
+    bp.frequency.exponentialRampToValueAtTime(8000, t + 1.0);
+    const nGain = ctx.createGain();
+    nGain.gain.setValueAtTime(0,   t);
+    nGain.gain.linearRampToValueAtTime(0.5, t + 0.7);
+    nGain.gain.linearRampToValueAtTime(0,   t + 1.0);
+    this._play([src, bp, nGain], t);
+  },
+
+  // Plasma shot: sawtooth 220 Hz, low-pass sweeping down, 0.12 s
+  plasma() {
+    if (!this.ctx) return;
+    const { ctx } = this; const t = ctx.currentTime;
+    const osc = ctx.createOscillator(), lp = ctx.createBiquadFilter(), g = ctx.createGain();
+    osc.type = 'sawtooth'; osc.frequency.value = 220;
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(2200, t);
+    lp.frequency.exponentialRampToValueAtTime(180, t + 0.12);
+    g.gain.setValueAtTime(0.4, t); g.gain.linearRampToValueAtTime(0, t + 0.12);
+    this._play([osc, lp, g], t, 0.12);
+  },
+
+  // Laser: sine 880 Hz + sawtooth 220 Hz, ring-mod feel, 0.3 s
+  laser() {
+    if (!this.ctx) return;
+    const { ctx } = this; const t = ctx.currentTime;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.35, t); g.gain.linearRampToValueAtTime(0, t + 0.3);
+    g.connect(ctx.destination);
+    [['sine', 880], ['sawtooth', 220]].forEach(([type, freq]) => {
+      const o = ctx.createOscillator();
+      o.type = type; o.frequency.value = freq;
+      o.connect(g); o.start(t); o.stop(t + 0.31);
+    });
+  },
+
+  // Grenade explosion: white noise, low-pass 800 Hz, 0.4 s
+  grenade() {
+    if (!this.ctx) return;
+    const { ctx } = this; const t = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = this._noise(0.4);
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 800;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.8, t); g.gain.linearRampToValueAtTime(0, t + 0.4);
+    this._play([src, lp, g], t);
+  },
+
+  // ── Ambient drones ────────────────────────────────────────────────────────
+
+  _ambientGain:  null,
+  _ambientNodes: [],
+
+  _loopNoise() {
+    const sr = this.ctx.sampleRate, len = sr * 2;
+    const buf = this.ctx.createBuffer(1, len, sr);
+    const d   = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  },
+
+  stopAmbient() {
+    for (const n of this._ambientNodes) { try { n.stop(); } catch(e) {} }
+    this._ambientNodes = [];
+    if (this._ambientGain) {
+      this._ambientGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.3);
+    }
+  },
+
+  startAmbient(act) {
+    if (!this.ctx) return;
+    this.stopAmbient();
+    const ag = this.ctx.createGain();
+    ag.gain.setValueAtTime(0, this.ctx.currentTime);
+    ag.gain.linearRampToValueAtTime(0.12, this.ctx.currentTime + 1.5);
+    ag.connect(this.ctx.destination);
+    this._ambientGain = ag;
+
+    const mk = (type, freq) => {
+      const o = this.ctx.createOscillator(); o.type = type; o.frequency.value = freq;
+      o.connect(ag); o.start(); this._ambientNodes.push(o); return o;
+    };
+    const mkFilt = (type, freq) => {
+      const f = this.ctx.createBiquadFilter(); f.type = type; f.frequency.value = freq;
+      return f;
+    };
+
+    switch (act) {
+      case 1: { // Sine 110 Hz + filtered noise (radio static)
+        mk('sine', 110);
+        const src = this.ctx.createBufferSource(); src.buffer = this._loopNoise(); src.loop = true;
+        const lp = mkFilt('lowpass', 800); src.connect(lp); lp.connect(ag); src.start();
+        this._ambientNodes.push(src); break;
+      }
+      case 2: { // Detuned dual sine 90/93 Hz
+        mk('sine', 90); mk('sine', 93); break;
+      }
+      case 3: { // Sine 60 Hz + slow LFO on cutoff
+        const osc = mk('sine', 60);
+        const lp  = mkFilt('lowpass', 800);
+        const lfo = this.ctx.createOscillator(), lfoG = this.ctx.createGain();
+        lfo.frequency.value = 0.25; lfoG.gain.value = 350;
+        lfo.connect(lfoG); lfoG.connect(lp.frequency);
+        osc.disconnect(); osc.connect(lp); lp.connect(ag);
+        lfo.start(); this._ambientNodes.push(lfo); break;
+      }
+      case 4: { // Pulsing siren 440↔660 Hz + low rumble
+        const siren = mk('sine', 550);
+        const lfo = this.ctx.createOscillator(), lfoG = this.ctx.createGain();
+        lfo.type = 'square'; lfo.frequency.value = 0.5; lfoG.gain.value = 110;
+        lfo.connect(lfoG); lfoG.connect(siren.frequency); lfo.start();
+        this._ambientNodes.push(lfo);
+        mk('sine', 60); break;
+      }
+    }
+  }
+};
+
+// ===== 5. INPUT SYSTEM =====
+
+const Input = {
+  _held: {},
+  _justDown: new Set(), // keys pressed this logic tick (consumed once read)
+
+  init() {
+    window.addEventListener('keydown', e => {
+      Sfx._boot();
+      if (!this._held[e.code]) this._justDown.add(e.code);
+      this._held[e.code] = true;
+      if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        e.preventDefault();
+      }
+    });
+    window.addEventListener('keyup', e => {
+      this._held[e.code] = false;
+      this._justDown.delete(e.code);
+    });
+  },
+
+  held(code) { return !!this._held[code]; },
+
+  // Returns true once per key-press; removes from set (consumed).
+  consumePressed(code) {
+    if (this._justDown.has(code)) { this._justDown.delete(code); return true; }
+    return false;
+  },
+
+  moveVec() {
+    let dx = 0, dy = 0;
+    if (this.held('KeyW')) dy -= 1;
+    if (this.held('KeyS')) dy += 1;
+    if (this.held('KeyA')) dx -= 1;
+    if (this.held('KeyD')) dx += 1;
+    return { dx, dy };
+  },
+
+  // Returns unit aim vector from arrow keys, or null if none held.
+  aimVec() {
+    if (this.held('ArrowUp'))    return { dx:  0, dy: -1 };
+    if (this.held('ArrowDown'))  return { dx:  0, dy:  1 };
+    if (this.held('ArrowLeft'))  return { dx: -1, dy:  0 };
+    if (this.held('ArrowRight')) return { dx:  1, dy:  0 };
+    return null;
+  }
+};
+
+// ===== 6. ENTITY CLASSES =====
+
+// Push entity out of rect using minimum-overlap axis.
+function resolveAABB(ent, rect) {
+  const ox1 = ent.x + ent.w - rect.x;
+  const ox2 = rect.x + rect.w - ent.x;
+  const oy1 = ent.y + ent.h - rect.y;
+  const oy2 = rect.y + rect.h - ent.y;
+  if (ox1 <= 0 || ox2 <= 0 || oy1 <= 0 || oy2 <= 0) return;
+  if (Math.min(ox1, ox2) <= Math.min(oy1, oy2)) {
+    ent.x += ox1 <= ox2 ? -ox1 : ox2;
+  } else {
+    ent.y += oy1 <= oy2 ? -oy1 : oy2;
+  }
+}
+
+// --- Player ---
+
+class Player {
+  constructor(x, y) {
+    this.x = x;  this.y = y;
+    this.w = 8;  this.h = 8;
+    this.hp = 5; this.maxHp = 5;
+
+    this.speed       = 90;    // px/s base
+    this.sprintMult  = 1.5;
+    this.stamina     = 2;     // seconds at full charge
+    this.staminaMax  = 2;
+    this.staminaRegen = 0.5;  // per-second; 4 s to full recharge
+
+    this.sprinting   = false;
+    this.facing      = { dx: 0, dy: -1 }; // last aim direction
+
+    this.iframes     = 0;     // ticks of invulnerability
+    this.fireCooldown = 0;
+    // Weapons — expanded in step 10; one entry per owned weapon
+    this.weapons = [
+      { name: 'PULSE', dmg: 1, rate: 4, speed: 240, ammo: Infinity, maxAmmo: Infinity }
+    ];
+    this.weaponIdx   = 0;
+    this.fireRate    = 4;     // mirrors active weapon (kept for convenience)
+    this.bulletSpeed = 240;
+
+    this.grenades    = 1;     // start with 1; max 5
+    this.maxGrenades = 5;
+
+    this.alive = true;
+  }
+
+  update(dt, walls, bullets) {
+    // --- Sprint ---
+    const wantSprint = Input.held('ShiftLeft') || Input.held('ShiftRight');
+    if (wantSprint && this.stamina > 0) {
+      this.sprinting = true;
+      this.stamina = Math.max(0, this.stamina - dt);
+      if (this.stamina === 0) this.sprinting = false;
+    } else {
+      this.sprinting = false;
+      this.stamina = Math.min(this.staminaMax, this.stamina + this.staminaRegen * dt);
+    }
+
+    // --- Move ---
+    const { dx, dy } = Input.moveVec();
+    const len = Math.hypot(dx, dy);
+    if (len > 0) {
+      const spd = this.speed * (this.sprinting ? this.sprintMult : 1);
+      this.x += (dx / len) * spd * dt;
+      this.y += (dy / len) * spd * dt;
+    }
+
+    for (const w of walls) resolveAABB(this, w);
+
+    // --- Weapon switch (Tab) ---
+    if (Input.consumePressed('Tab') && this.weapons.length > 1) {
+      this.weaponIdx    = (this.weaponIdx + 1) % this.weapons.length;
+      this.fireCooldown = 0;
+    }
+
+    // --- Aim + fire ---
+    const aim = Input.aimVec();
+    if (aim) this.facing = aim;
+
+    const wep = this.weapons[this.weaponIdx];
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+
+    if (aim && this.fireCooldown === 0 && (wep.ammo > 0 || wep.ammo === Infinity)) {
+      const cx = this.x + this.w / 2;
+      const cy = this.y + this.h / 2;
+      if (wep.name === 'LASER') {
+        beams.push(new Beam(cx, cy, aim.dx, aim.dy));
+        if (wep.ammo !== Infinity) wep.ammo--;
+        Sfx.laser();
+      } else {
+        const pierce = wep.name === 'PLASMA' ? 1 : 0;
+        bullets.push(new Bullet(cx - 1, cy - 1,
+          aim.dx * wep.speed, aim.dy * wep.speed,
+          wep.dmg, 'player', pierce));
+        if (wep.ammo !== Infinity) wep.ammo--;
+        wep.name === 'PLASMA' ? Sfx.plasma() : Sfx.shot();
+      }
+      this.fireCooldown = 1 / wep.rate;
+    }
+
+    // --- Grenade (Space) ---
+    if (Input.consumePressed('Space') && this.grenades > 0) {
+      grenadeList.push(new Grenade(
+        this.x + this.w / 2 - 2, this.y + this.h / 2 - 2,
+        this.facing.dx, this.facing.dy
+      ));
+      this.grenades--;
+    }
+
+    if (this.iframes > 0) this.iframes--;
+  }
+
+  takeDamage(dmg) {
+    if (this.iframes > 0) return;
+    this.hp -= dmg;
+    this.iframes = 60;
+    spawnHitSparks(this.x + 4, this.y + 4);
+    hitShake = 3;
+    Sfx.playerHit();
+  }
+
+  draw(ctx) {
+    const blink = this.iframes > 0 && Math.floor(this.iframes / 4) % 2 === 0;
+    ctx.fillStyle = blink ? PALETTE[15] : PALETTE[9];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+    // Gun barrel nub in facing direction
+    ctx.fillStyle = PALETTE[5];
+    ctx.fillRect(
+      Math.round(this.x + 3 + this.facing.dx * 5),
+      Math.round(this.y + 3 + this.facing.dy * 5),
+      2, 2
+    );
+  }
+}
+
+// --- Bullet ---
+
+class Bullet {
+  constructor(x, y, vx, vy, dmg, owner, pierce = 0, tracking = 0) {
+    this.x = x;  this.y = y;
+    this.vx = vx; this.vy = vy;
+    this.w = 2;  this.h = 2;
+    this.dmg      = dmg;
+    this.owner    = owner;
+    this.pierce   = pierce;
+    this.tracking = tracking; // homing strength — nudges bullet toward player each frame
+    this.hitSet   = new Set();
+    this.alive    = true;
+  }
+
+  update(dt) {
+    if (this.tracking && player && player.alive) {
+      const tx = player.x + 4 - this.x, ty = player.y + 4 - this.y;
+      const tl = Math.hypot(tx, ty) || 1;
+      this.vx += tx / tl * this.tracking * dt;
+      this.vy += ty / tl * this.tracking * dt;
+      const sp = Math.hypot(this.vx, this.vy) || 1;
+      this.vx = this.vx / sp * 90; this.vy = this.vy / sp * 90;
+    }
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    if (this.x < -4 || this.x > W + 4 || this.y < -4 || this.y > H + 4) this.alive = false;
+  }
+
+  draw(ctx) {
+    ctx.fillStyle = this.owner === 'player' ? PALETTE[12] : PALETTE[10];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+  }
+}
+
+// AABB overlap test (no push — for collision queries).
+function overlaps(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x &&
+         a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Fire one enemy bullet aimed 8-16 px off the player (intentional miss).
+function _fireAt(cx, cy, px, py, speed, bullets) {
+  const miss = 8 + Math.random() * 8;
+  const mAng = Math.random() * Math.PI * 2;
+  const tx = px + Math.cos(mAng) * miss;
+  const ty = py + Math.sin(mAng) * miss;
+  const dx = tx - cx, dy = ty - cy;
+  const len = Math.hypot(dx, dy);
+  if (len > 0) bullets.push(new Bullet(cx - 1, cy - 1,
+    dx / len * speed, dy / len * speed, 1, 'enemy'));
+}
+
+// --- Enemy (base) ---
+
+class Enemy {
+  constructor(x, y, w, h) {
+    this.x = x; this.y = y;
+    this.w = w; this.h = h;
+    this.hp = 1; this.maxHp = 1;
+    this.alive   = true;
+    this.iframes = 0;
+    this.kbVx = 0; this.kbVy = 0; this.kbTimer = 0; // knockback velocity
+  }
+
+  takeDamage(dmg) {
+    if (this.iframes > 0) return;
+    this.hp -= dmg;
+    this.iframes = 8;
+    if (this.hp <= 0) {
+      this.alive = false;
+      spawnDeathBurst(this.x + this.w / 2, this.y + this.h / 2);
+      Sfx.enemyDie();
+    } else Sfx.enemyHit();
+  }
+}
+
+// --- Grunt ---
+// 12×16 khaki soldier. 2 HP. 50 px/s patrol.
+// Detects player at <150 px — stops and fires once/s with intentional miss.
+
+class Grunt extends Enemy {
+  constructor(x, y) {
+    super(x, y, 12, 16);
+    this.hp = 2; this.maxHp = 2;
+    this.speed = 50;
+    this.dir   = Math.random() < 0.5 ? 1 : -1;
+    this.state = 'PATROL';
+    this.fireCooldown = 1 + Math.random(); // stagger initial shots
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + this.w / 2;
+    const cy = this.y + this.h / 2;
+    const px = player.x + player.w / 2;
+    const py = player.y + player.h / 2;
+
+    this.iframes      = Math.max(0, this.iframes - 1);
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+
+    this.state = Math.hypot(cx - px, cy - py) < 150 ? 'ATTACK' : 'PATROL';
+
+    if (this.state === 'PATROL') {
+      const prevX = this.x;
+      this.x += this.dir * this.speed * dt;
+      for (const w of walls) resolveAABB(this, w);
+      // Wall collision stopped horizontal movement → reverse
+      if (Math.abs(this.x - prevX) < this.speed * dt * 0.5) this.dir *= -1;
+
+    } else if (this.fireCooldown === 0) {
+      // Fire toward a point 8-16px off the player (intentional miss)
+      const miss = 8 + Math.random() * 8;
+      const mAng = Math.random() * Math.PI * 2;
+      const tx = px + Math.cos(mAng) * miss;
+      const ty = py + Math.sin(mAng) * miss;
+      const tdx = tx - cx, tdy = ty - cy;
+      const tlen = Math.hypot(tdx, tdy);
+      if (tlen > 0) {
+        bullets.push(new Bullet(cx - 1, cy - 1,
+          (tdx / tlen) * 120, (tdy / tlen) * 120, 1, 'enemy'));
+      }
+      this.fireCooldown = 1;
+    }
+
+    // Contact damage to player handled in game loop via overlaps()
+  }
+
+  draw(ctx) {
+    const flash = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    // Body (torso + legs)
+    ctx.fillStyle = flash ? PALETTE[15] : PALETTE[7]; // khaki uniform
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 5), 8, 11);
+    // Head
+    ctx.fillStyle = flash ? PALETTE[15] : PALETTE[6]; // brown
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y),  6,  5);
+  }
+}
+
+// --- Sergeant ---
+// 14×18, dark fatigues + red beret. 3 HP. 60 px/s.
+// Burst-fires 3 shots, then dashes for cover.
+
+class Sergeant extends Enemy {
+  constructor(x, y) {
+    super(x, y, 14, 18);
+    this.hp = 3; this.maxHp = 3;
+    this.speed = 60;
+    this.dir   = Math.random() < 0.5 ? 1 : -1;
+    this.state = 'PATROL';
+    this.burstCount   = 0;
+    this.fireCooldown = 1 + Math.random();
+    this.coverTimer   = 0;
+    this.coverDx = 0; this.coverDy = 0;
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + this.w / 2, cy = this.y + this.h / 2;
+    const px = player.x + player.w / 2, py = player.y + player.h / 2;
+    const dist = Math.hypot(cx - px, cy - py);
+    this.iframes      = Math.max(0, this.iframes - 1);
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+
+    if (this.state === 'PATROL') {
+      const prevX = this.x;
+      this.x += this.dir * this.speed * dt;
+      for (const w of walls) resolveAABB(this, w);
+      if (Math.abs(this.x - prevX) < this.speed * dt * 0.5) this.dir *= -1;
+      if (dist < 140) { this.state = 'SHOOT'; this.burstCount = 0; this.fireCooldown = 0.2; }
+
+    } else if (this.state === 'SHOOT') {
+      if (this.burstCount >= 3) {
+        this.state = 'COVER'; this.burstCount = 0;
+        this.coverTimer = 0.5 + Math.random() * 0.5;
+        this.coverDx = Math.random() < 0.5 ? 1 : -1;
+        this.coverDy = (Math.random() - 0.5);
+      } else if (this.fireCooldown === 0) {
+        _fireAt(cx, cy, px, py, 140, bullets);
+        this.burstCount++;
+        this.fireCooldown = 0.15;
+      }
+
+    } else { // COVER
+      this.x += this.coverDx * this.speed * dt;
+      this.y += this.coverDy * this.speed * dt;
+      for (const w of walls) resolveAABB(this, w);
+      this.coverTimer -= dt;
+      if (this.coverTimer <= 0) {
+        this.state = dist < 140 ? 'SHOOT' : 'PATROL';
+        this.fireCooldown = 0.3;
+      }
+    }
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[8]; // dark green fatigues
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 5), 10, 13);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[6]; // head
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y + 1),  8,  4);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[10]; // red beret
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y - 2), 10,  3);
+  }
+}
+
+// --- Twitchy ---
+// 12×16, visible alien bulges. 2 HP. 110 px/s. No shooting — charges player.
+
+class Twitchy extends Enemy {
+  constructor(x, y) {
+    super(x, y, 12, 16);
+    this.hp = 2; this.maxHp = 2;
+    this.speed = 110;
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + this.w / 2, cy = this.y + this.h / 2;
+    const px = player.x + player.w / 2, py = player.y + player.h / 2;
+    const dist = Math.hypot(cx - px, cy - py);
+    this.iframes = Math.max(0, this.iframes - 1);
+    if (dist > 0) {
+      this.x += (px - cx) / dist * this.speed * dt;
+      this.y += (py - cy) / dist * this.speed * dt;
+    }
+    for (const w of walls) resolveAABB(this, w);
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[7]; // khaki
+    ctx.fillRect(Math.round(this.x + 1), Math.round(this.y + 4), 10, 12);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[6]; // head
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y),  6,  4);
+    // Alien bulges (foreshadow act 2)
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14]; // magenta
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 6),  3, 3);
+    ctx.fillRect(Math.round(this.x + 7), Math.round(this.y + 9),  3, 3);
+  }
+}
+
+// --- GeneralHayes (Boss) ---
+// Phase 1: 8 HP, 16×20 officer. Burst-fires 3-shot salvos, retreats to desk cover.
+// Phase 2 (The Vessel): 12 HP, 24×24. Charges at 140 px/s + ranged spit every 1.5 s.
+
+class GeneralHayes extends Enemy {
+  constructor(x, y) {
+    super(x, y, 16, 20);
+    this.hp = 8; this.maxHp = 8;
+    this.phase = 1;
+    this.speed = 70;
+    this.state = 'APPROACH';
+
+    this.burstCount   = 0;
+    this.fireCooldown = 0;
+    this.coverTimer   = 0;
+    this.coverDx = 0; this.coverDy = 0;
+
+    // Phase 2
+    this.spitTimer    = 2;
+    this.charging     = false;
+    this.chargeTimer  = 0;
+    this.chargeDx = 0; this.chargeDy = 0;
+
+    // Transition animation
+    this.transitioning  = false;
+    this.transitionTimer = 0;
+
+    // Dialogue
+    this._lines    = ["You shouldn't have come here.", "We're past saving.", "You're already too late."];
+    this._lineIdx  = 0;
+    this.dialogueText  = '';
+    this.dialogueTimer = 0;
+    this._hpThresholds = [6, 3]; // trigger next line at these HP values
+  }
+
+  // Cover positions (adjacent to the four corner desks in act1_r10)
+  _nearestCover(cx, cy) {
+    const pts = [{ x: 68, y: 42 }, { x: 252, y: 42 }, { x: 68, y: 194 }, { x: 252, y: 194 }];
+    return pts.reduce((best, p) =>
+      Math.hypot(cx - p.x, cy - p.y) < Math.hypot(cx - best.x, cy - best.y) ? p : best);
+  }
+
+  _triggerDialogue() {
+    if (this._lineIdx < this._lines.length) {
+      this.dialogueText  = this._lines[this._lineIdx++];
+      this.dialogueTimer = 3;
+    }
+  }
+
+  takeDamage(dmg) {
+    if (this.iframes > 0 || this.transitioning) return;
+    this.hp -= dmg;
+    this.iframes = 8;
+    // Dialogue thresholds
+    if (this._hpThresholds.length && this.hp <= this._hpThresholds[0]) {
+      this._hpThresholds.shift();
+      this._triggerDialogue();
+    }
+    if (this.hp <= 0) {
+      if (this.phase === 1) {
+        this.hp = 0;
+        this.transitioning  = true;
+        this.transitionTimer = 1.0;
+        this.iframes = 60;
+        this._triggerDialogue(); // "You're already too late."
+        Sfx.bossTransition();
+      } else {
+        this.alive = false;
+        Sfx.enemyDie();
+      }
+    } else { Sfx.enemyHit(); }
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + this.w / 2, cy = this.y + this.h / 2;
+    const px = player.x + player.w / 2, py = player.y + player.h / 2;
+    const dist = Math.hypot(cx - px, cy - py);
+
+    this.iframes      = Math.max(0, this.iframes - 1);
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+    if (this.dialogueTimer > 0) this.dialogueTimer -= dt;
+
+    if (this.transitioning) {
+      this.transitionTimer -= dt;
+      if (this.transitionTimer <= 0) {
+        this.transitioning = false;
+        this.phase = 2;
+        this.hp = 12; this.maxHp = 12;
+        this.w = 24;  this.h = 24;
+        this.speed = 90;
+        this.state = 'ROAM';
+        this.spitTimer = 1.5;
+        this.dialogueText = ''; // clear last line
+      }
+      return;
+    }
+
+    if (this.phase === 1) {
+      // --- APPROACH: close the gap ---
+      if (this.state === 'APPROACH') {
+        if (this.burstCount === 0 && dist < 130) this._triggerDialogue();
+        if (dist > 0) {
+          const s = this.speed * dt / dist;
+          this.x += (px - cx) * s; this.y += (py - cy) * s;
+        }
+        for (const w of walls) resolveAABB(this, w);
+        if (dist < 130) { this.state = 'SHOOT'; this.burstCount = 0; }
+
+      // --- SHOOT: 3-shot burst ---
+      } else if (this.state === 'SHOOT') {
+        if (this.burstCount >= 3) {
+          this.state = 'COVER'; this.burstCount = 0;
+          this.coverTimer = 0.7 + Math.random() * 0.4;
+          const cover = this._nearestCover(cx, cy);
+          const cd = Math.hypot(cover.x - cx, cover.y - cy) || 1;
+          this.coverDx = (cover.x - cx) / cd;
+          this.coverDy = (cover.y - cy) / cd;
+        } else if (this.fireCooldown === 0) {
+          _fireAt(cx, cy, px, py, 140, bullets);
+          this.burstCount++;
+          this.fireCooldown = 0.15;
+        }
+
+      // --- COVER: retreat to desk ---
+      } else {
+        this.x += this.coverDx * this.speed * dt;
+        this.y += this.coverDy * this.speed * dt;
+        for (const w of walls) resolveAABB(this, w);
+        this.coverTimer -= dt;
+        if (this.coverTimer <= 0) this.state = 'APPROACH';
+      }
+
+    } else {
+      // Phase 2 — The Vessel
+      this.spitTimer = Math.max(0, this.spitTimer - dt);
+
+      if (this.charging) {
+        this.x += this.chargeDx * 140 * dt;
+        this.y += this.chargeDy * 140 * dt;
+        for (const w of walls) resolveAABB(this, w);
+        this.chargeTimer -= dt;
+        if (this.chargeTimer <= 0) this.charging = false;
+      } else if (dist < 80) {
+        // Start charge
+        this.charging = true; this.chargeTimer = 1.5;
+        this.chargeDx = (px - cx) / (dist || 1);
+        this.chargeDy = (py - cy) / (dist || 1);
+      } else {
+        // Roam toward player
+        if (dist > 0) {
+          const s = this.speed * dt / dist;
+          this.x += (px - cx) * s; this.y += (py - cy) * s;
+        }
+        for (const w of walls) resolveAABB(this, w);
+      }
+
+      // Spit
+      if (this.spitTimer === 0) {
+        _fireAt(cx, cy, px, py, 120, bullets);
+        this.spitTimer = 1.5;
+      }
+    }
+  }
+
+  draw(ctx) {
+    if (this.transitioning) {
+      const fl = Math.floor(this.transitionTimer * 16) % 2 === 0;
+      ctx.fillStyle = fl ? PALETTE[10] : PALETTE[15];
+      ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+      return;
+    }
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    if (this.phase === 1) {
+      // Officer dress uniform
+      ctx.fillStyle = fl ? PALETTE[15] : PALETTE[2]; // dark blue uniform
+      ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 6), 12, 14);
+      ctx.fillStyle = fl ? PALETTE[15] : PALETTE[6]; // skin
+      ctx.fillRect(Math.round(this.x + 4), Math.round(this.y),  8,  6);
+      ctx.fillStyle = fl ? PALETTE[15] : PALETTE[12]; // gold trim
+      ctx.fillRect(Math.round(this.x + 5), Math.round(this.y + 8), 6, 2);
+    } else {
+      // The Vessel — chitinous body
+      ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13]; // purple chitin
+      ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+      // Glowing eyes
+      ctx.fillStyle = PALETTE[14];
+      ctx.fillRect(Math.round(this.x + 4),  Math.round(this.y + 5), 4, 3);
+      ctx.fillRect(Math.round(this.x + 16), Math.round(this.y + 5), 4, 3);
+      ctx.fillStyle = PALETTE[0];
+      ctx.fillRect(Math.round(this.x + 5),  Math.round(this.y + 6), 2, 1);
+      ctx.fillRect(Math.round(this.x + 17), Math.round(this.y + 6), 2, 1);
+    }
+  }
+}
+
+// --- Pickup ---
+
+class Pickup {
+  constructor(type, x, y) {
+    this.type = type;
+    this.x = x - 6; this.y = y - 6; // center 12×12 on given coords
+    this.w = 12; this.h = 12;
+    this.alive = true;
+  }
+
+  draw(ctx) {
+    const C = { pistol: 7, plasma_rifle: 9, heavy_laser: 12,
+                medstim: 10, grenade: 11, ammo_plasma: 9, ammo_laser: 12 };
+    const L = { pistol: 'P', plasma_rifle: 'PL', heavy_laser: 'HL',
+                medstim: '+', grenade: 'G', ammo_plasma: 'AM', ammo_laser: 'AM' };
+    ctx.fillStyle = PALETTE[0];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+    ctx.fillStyle = PALETTE[C[this.type] || 5];
+    ctx.fillRect(Math.round(this.x + 1), Math.round(this.y + 1), 10, 10);
+    ctx.fillStyle = PALETTE[15];
+    ctx.font = '6px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(L[this.type] || '?', Math.round(this.x + 6), Math.round(this.y + 8));
+    ctx.textAlign = 'left';
+  }
+}
+
+// Collect a pickup: apply effect and remove from room data so it won't respawn.
+function collectPickup(pickup) {
+  pickup.alive = false;
+  const room = RoomManager.current;
+  const idx  = room.pickups.findIndex(p =>
+    p.type === pickup.type &&
+    Math.abs(p.x - (pickup.x + 6)) < 2 && Math.abs(p.y - (pickup.y + 6)) < 2);
+  if (idx >= 0) room.pickups.splice(idx, 1);
+
+  switch (pickup.type) {
+    case 'pistol':
+      if (!player.weapons.find(w => w.name === 'PISTOL'))
+        player.weapons.push({ name: 'PISTOL', dmg: 1, rate: 6, speed: 200, ammo: Infinity, maxAmmo: Infinity });
+      break;
+    case 'plasma_rifle':
+      if (!player.weapons.find(w => w.name === 'PLASMA'))
+        player.weapons.push({ name: 'PLASMA', dmg: 2, rate: 2, speed: 160, ammo: 30, maxAmmo: 60 });
+      break;
+    case 'heavy_laser':
+      if (!player.weapons.find(w => w.name === 'LASER'))
+        player.weapons.push({ name: 'LASER', dmg: 4, rate: 1, speed: 0, ammo: 8, maxAmmo: 16 });
+      break;
+    case 'medstim':
+      player.hp = Math.min(player.maxHp, player.hp + 2);
+      break;
+    case 'grenade':
+      player.maxGrenades = Math.min(5, player.maxGrenades + 1);
+      player.grenades    = Math.min(player.maxGrenades, player.grenades + 1);
+      break;
+    case 'ammo_plasma': { const w = player.weapons.find(w => w.name === 'PLASMA');
+      if (w) w.ammo = Math.min(w.maxAmmo, w.ammo + 15); break; }
+    case 'ammo_laser':  { const w = player.weapons.find(w => w.name === 'LASER');
+      if (w) w.ammo = Math.min(w.maxAmmo, w.ammo + 4);  break; }
+  }
+  Sfx.pickup();
+}
+
+// --- Beam (Heavy Laser) ---
+
+// Slab-method ray–AABB distance. Returns t where ray first enters any wall rect.
+function raycastDist(ox, oy, dx, dy, walls) {
+  let best = Math.hypot(W, H);
+  for (const w of walls) {
+    const txA = dx ? (w.x - ox) / dx : -Infinity;
+    const txB = dx ? (w.x + w.w - ox) / dx : Infinity;
+    const tyA = dy ? (w.y - oy) / dy : -Infinity;
+    const tyB = dy ? (w.y + w.h - oy) / dy : Infinity;
+    const tEnter = Math.max(Math.min(txA, txB), Math.min(tyA, tyB));
+    const tLeave  = Math.min(Math.max(txA, txB), Math.max(tyA, tyB));
+    if (tLeave >= 0 && tEnter <= tLeave && tEnter >= 0 && tEnter < best) best = tEnter;
+  }
+  return best;
+}
+
+class Beam {
+  constructor(ox, oy, dx, dy) {
+    this.ox = ox; this.oy = oy;
+    this.dx = dx; this.dy = dy;
+    this.length = raycastDist(ox, oy, dx, dy, RoomManager.activeWalls());
+    this.timer  = 0.12;
+    this.alive  = true;
+    this._damage();
+  }
+
+  _damage() {
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const ecx = e.x + e.w / 2, ecy = e.y + e.h / 2;
+      // Project enemy centre onto beam segment
+      const t  = Math.max(0, Math.min(this.length,
+        (ecx - this.ox) * this.dx + (ecy - this.oy) * this.dy));
+      const nx = this.ox + this.dx * t, ny = this.oy + this.dy * t;
+      if (Math.hypot(nx - ecx, ny - ecy) < 10) {
+        e.takeDamage(4);
+        const kd = Math.hypot(ecx - this.ox, ecy - this.oy) || 1;
+        e.kbVx = (ecx - this.ox) / kd * 260;
+        e.kbVy = (ecy - this.oy) / kd * 260;
+        e.kbTimer = 0.25;
+      }
+    }
+  }
+
+  update(dt) { this.timer -= dt; if (this.timer <= 0) this.alive = false; }
+
+  draw(ctx) {
+    ctx.globalAlpha = Math.max(0, this.timer / 0.12);
+    const len = Math.round(this.length);
+    if (this.dx !== 0) {
+      const x = this.dx > 0 ? this.ox : this.ox - len;
+      ctx.fillStyle = PALETTE[12]; ctx.fillRect(Math.round(x), Math.round(this.oy - 1), len, 3);
+      ctx.fillStyle = PALETTE[15]; ctx.fillRect(Math.round(x), Math.round(this.oy),     len, 1);
+    } else {
+      const y = this.dy > 0 ? this.oy : this.oy - len;
+      ctx.fillStyle = PALETTE[12]; ctx.fillRect(Math.round(this.ox - 1), Math.round(y), 3, len);
+      ctx.fillStyle = PALETTE[15]; ctx.fillRect(Math.round(this.ox),     Math.round(y), 1, len);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+// --- Grenade ---
+
+class Grenade {
+  constructor(x, y, dx, dy) {
+    this.x = x; this.y = y;
+    this.w = 4; this.h = 4;
+    this.vx = dx * 120; this.vy = dy * 120;
+    this.fuse      = 0.8;
+    this.exploded  = false;
+    this.flashTimer = 0;
+    this.alive     = true;
+  }
+
+  update(dt, walls) {
+    if (this.exploded) {
+      this.flashTimer -= dt;
+      if (this.flashTimer <= 0) this.alive = false;
+      return;
+    }
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    // Bounce off walls
+    for (const w of walls) {
+      const px = this.x, py = this.y;
+      resolveAABB(this, w);
+      if (this.x !== px) this.vx *= -0.5;
+      if (this.y !== py) this.vy *= -0.5;
+    }
+    this.fuse -= dt;
+    if (this.fuse <= 0) this._explode();
+  }
+
+  _explode() {
+    this.exploded   = true;
+    this.flashTimer = 0.2;
+    const cx = this.x + 2, cy = this.y + 2;
+    for (const e of enemies) {
+      if (e.alive && Math.hypot((e.x + e.w/2) - cx, (e.y + e.h/2) - cy) < 32)
+        e.takeDamage(3);
+    }
+    Sfx.grenade();
+  }
+
+  draw(ctx) {
+    if (this.exploded) {
+      ctx.globalAlpha = Math.max(0, this.flashTimer / 0.2);
+      ctx.fillStyle   = PALETTE[11];
+      ctx.fillRect(Math.round(this.x - 26), Math.round(this.y - 26), 60, 60);
+      ctx.globalAlpha = 1;
+      return;
+    }
+    ctx.fillStyle = PALETTE[11];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+  }
+}
+
+// --- HybridSoldier ---
+// 14×18, ragged uniform + chitinous carapace. 4 HP. 70 px/s.
+// 2-shot burst; lunges at player if within 60 px.
+
+class HybridSoldier extends Enemy {
+  constructor(x, y) {
+    super(x, y, 14, 18);
+    this.hp = 4; this.maxHp = 4;
+    this.speed = 70;
+    this.dir   = Math.random() < 0.5 ? 1 : -1;
+    this.state = 'PATROL';
+    this.burstCount   = 0;
+    this.fireCooldown = 1 + Math.random();
+    this.coverTimer   = 0;
+    this.coverDx = 0; this.coverDy = 0;
+    this.lunging      = false;
+    this.lungeTimer   = 0;
+    this.lungeDx = 0; this.lungeDy = 0;
+    this.lungeCooldown = 2 + Math.random();
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + 7, cy = this.y + 9;
+    const px = player.x + 4, py = player.y + 4;
+    const dist = Math.hypot(cx - px, cy - py);
+    this.iframes      = Math.max(0, this.iframes - 1);
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+    this.lungeCooldown = Math.max(0, this.lungeCooldown - dt);
+
+    if (this.lunging) {
+      this.x += this.lungeDx * 200 * dt;
+      this.y += this.lungeDy * 200 * dt;
+      for (const w of walls) resolveAABB(this, w);
+      this.lungeTimer -= dt;
+      if (this.lungeTimer <= 0) { this.lunging = false; this.state = 'PATROL'; }
+      return;
+    }
+
+    if (dist < 60 && this.lungeCooldown === 0) {
+      this.lunging = true; this.lungeTimer = 0.3;
+      this.lungeCooldown = 2 + Math.random();
+      const d = dist || 1;
+      this.lungeDx = (px - cx) / d; this.lungeDy = (py - cy) / d;
+      return;
+    }
+
+    if (this.state === 'PATROL') {
+      const prevX = this.x;
+      this.x += this.dir * this.speed * dt;
+      for (const w of walls) resolveAABB(this, w);
+      if (Math.abs(this.x - prevX) < this.speed * dt * 0.5) this.dir *= -1;
+      if (dist < 120) { this.state = 'SHOOT'; this.burstCount = 0; this.fireCooldown = 0.2; }
+    } else if (this.state === 'SHOOT') {
+      if (this.burstCount >= 2) {
+        this.state = 'COVER'; this.burstCount = 0;
+        this.coverTimer = 0.6 + Math.random() * 0.4;
+        this.coverDx = Math.random() < 0.5 ? 1 : -1;
+        this.coverDy = (Math.random() - 0.5);
+      } else if (this.fireCooldown === 0) {
+        _fireAt(cx, cy, px, py, 140, bullets);
+        this.burstCount++;
+        this.fireCooldown = 0.18;
+      }
+    } else {
+      this.x += this.coverDx * this.speed * dt;
+      this.y += this.coverDy * this.speed * dt;
+      for (const w of walls) resolveAABB(this, w);
+      this.coverTimer -= dt;
+      if (this.coverTimer <= 0) { this.state = dist < 120 ? 'SHOOT' : 'PATROL'; this.fireCooldown = 0.2; }
+    }
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[6];  // ragged brown uniform
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 5), 10, 13);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13]; // purple carapace chest
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y + 5),  8,  8);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[6];  // head
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y),  8,  5);
+  }
+}
+
+// --- AlienGrunt ---
+// 14×16, chitinous. 3 HP. 100 px/s. Pure melee. Faster + tougher than Twitchy.
+
+class AlienGrunt extends Enemy {
+  constructor(x, y) {
+    super(x, y, 14, 16);
+    this.hp = 3; this.maxHp = 3;
+    this.speed = 100;
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + 7, cy = this.y + 8;
+    const px = player.x + 4, py = player.y + 4;
+    const dist = Math.hypot(cx - px, cy - py);
+    this.iframes = Math.max(0, this.iframes - 1);
+    if (dist > 0) {
+      this.x += (px - cx) / dist * this.speed * dt;
+      this.y += (py - cy) / dist * this.speed * dt;
+    }
+    for (const w of walls) resolveAABB(this, w);
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13];
+    ctx.fillRect(Math.round(this.x + 1), Math.round(this.y + 4), 12, 12);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y),  10,  4);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[0]; // claws
+    ctx.fillRect(Math.round(this.x),     Math.round(this.y + 7), 3, 5);
+    ctx.fillRect(Math.round(this.x + 11), Math.round(this.y + 7), 3, 5);
+  }
+}
+
+// --- SporeDrone ---
+// 12×12, bloated. 1 HP. 30 px/s. Explodes on death or contact → 24 px spore cloud.
+
+class SporeDrone extends Enemy {
+  constructor(x, y) {
+    super(x, y, 12, 12);
+    this.hp = 1; this.maxHp = 1;
+    this.speed = 30;
+    this._exploding = false;
+  }
+
+  update(dt, walls, player, bullets) {
+    if (this._exploding) return;
+    const cx = this.x + 6, cy = this.y + 6;
+    const px = player.x + 4, py = player.y + 4;
+    const dist = Math.hypot(cx - px, cy - py);
+    this.iframes = Math.max(0, this.iframes - 1);
+    if (dist > 0) {
+      this.x += (px - cx) / dist * this.speed * dt;
+      this.y += (py - cy) / dist * this.speed * dt;
+    }
+    for (const w of walls) resolveAABB(this, w);
+    if (dist < 14) this._burst();
+  }
+
+  takeDamage(dmg) {
+    if (this.iframes > 0) return;
+    this.hp -= dmg; this.iframes = 8;
+    if (this.hp <= 0) this._burst();
+    else Sfx.enemyHit();
+  }
+
+  _burst() {
+    if (this._exploding) return;
+    this._exploding = true;
+    this.alive = false;
+    sporeClouds.push(new SporeCloud(this.x + 6, this.y + 6));
+    Sfx.enemyDie();
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 12, 12);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[9];
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y + 3), 6, 6);
+  }
+}
+
+// --- SporeCloud ---
+// Lingers 3 s; damages player once per second on contact.
+
+class SporeCloud {
+  constructor(x, y) {
+    this.x = x - 12; this.y = y - 12;
+    this.w = 24; this.h = 24;
+    this.timer    = 3;
+    this.dmgTimer = 0;
+    this.alive    = true;
+  }
+
+  update(dt) {
+    this.timer    -= dt;
+    this.dmgTimer  = Math.max(0, this.dmgTimer - dt);
+    if (this.timer <= 0) { this.alive = false; return; }
+    if (overlaps(this, player) && this.dmgTimer === 0) {
+      player.takeDamage(1);
+      this.dmgTimer = 1;
+    }
+  }
+
+  draw(ctx) {
+    ctx.globalAlpha = Math.min(0.55, this.timer / 3 * 0.55);
+    ctx.fillStyle   = PALETTE[13];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// --- BroodNode ---
+// Stationary pulsing node. 3 HP. Spawns AlienGrunt every 6 s while alive.
+
+class BroodNode extends Enemy {
+  constructor(x, y) {
+    super(x, y, 14, 14);
+    this.hp = 3; this.maxHp = 3;
+    this.spawnTimer = 6 + Math.random() * 2; // stagger initial spawns
+    this.pulseT     = Math.random() * Math.PI * 2;
+  }
+
+  update(dt, walls, player, bullets) {
+    this.iframes    = Math.max(0, this.iframes - 1);
+    this.pulseT    += dt * 3;
+    this.spawnTimer -= dt;
+    if (this.spawnTimer <= 0) {
+      enemies.push(new AlienGrunt(
+        this.x + (Math.random() - 0.5) * 40,
+        this.y + (Math.random() - 0.5) * 40
+      ));
+      this.spawnTimer = 6;
+    }
+  }
+
+  draw(ctx) {
+    const fl   = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    const size = 14 + Math.round((Math.sin(this.pulseT) * 0.5 + 0.5) * 4);
+    const off  = Math.round((size - 14) / 2);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13];
+    ctx.fillRect(Math.round(this.x - off), Math.round(this.y - off), size, size);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y + 3), 8, 8);
+  }
+}
+
+// --- BroodMother ---
+// 18 HP. 40×40. Stationary. Invulnerable while any node is alive.
+// Kill all nodes → 10 s damage window → nodes respawn. Repeat until dead.
+
+class BroodMother extends Enemy {
+  constructor(x, y) {
+    super(x, y, 40, 40);
+    this.hp = 18; this.maxHp = 18;
+    this.vulnerable      = false;
+    this.vulnerableTimer = 0;
+    this.spitTimer       = 3;
+    this.nodes           = []; // populated by _spawnNodes()
+    // Fixed node positions for act2_r10
+    this._nodePos = [{ x: 41, y: 25 }, { x: 257, y: 25 }, { x: 153, y: 185 }];
+  }
+
+  _spawnNodes() {
+    for (const p of this._nodePos) {
+      const n = new BroodNode(p.x, p.y);
+      enemies.push(n);
+      this.nodes.push(n);
+    }
+  }
+
+  takeDamage(dmg) {
+    if (!this.vulnerable || this.iframes > 0) return;
+    this.hp -= dmg; this.iframes = 8;
+    if (this.hp <= 0) {
+      for (const n of this.nodes) n.alive = false; // kill remaining nodes
+      this.alive = false; Sfx.enemyDie();
+    } else { Sfx.enemyHit(); }
+  }
+
+  update(dt, walls, player, bullets) {
+    this.iframes   = Math.max(0, this.iframes - 1);
+    this.spitTimer = Math.max(0, this.spitTimer - dt);
+
+    const allDead = this.nodes.length > 0 && this.nodes.every(n => !n.alive);
+
+    if (allDead && !this.vulnerable) {
+      this.vulnerable      = true;
+      this.vulnerableTimer = 10;
+      this.nodes           = []; // clear refs; new ones added in respawn
+    }
+
+    if (this.vulnerable) {
+      this.vulnerableTimer -= dt;
+      if (this.vulnerableTimer <= 0 && this.hp > 0) {
+        this.vulnerable = false;
+        this._spawnNodes();
+      }
+    }
+
+    // Spit (faster when vulnerable)
+    if (this.spitTimer === 0) {
+      const cx = this.x + 20, cy = this.y + 20;
+      _fireAt(cx, cy, player.x + 4, player.y + 4, 90, bullets);
+      this.spitTimer = this.vulnerable ? 2 : 3;
+    }
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    // Main body
+    ctx.fillStyle = fl ? PALETTE[15] : (this.vulnerable ? PALETTE[10] : PALETTE[13]);
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 40, 40);
+    // Organic texture rings
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[0];
+    ctx.fillRect(Math.round(this.x + 4),  Math.round(this.y + 4),  32, 32);
+    ctx.fillStyle = fl ? PALETTE[15] : (this.vulnerable ? PALETTE[11] : PALETTE[14]);
+    ctx.fillRect(Math.round(this.x + 8),  Math.round(this.y + 8),  24, 24);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[0];
+    ctx.fillRect(Math.round(this.x + 14), Math.round(this.y + 14), 12, 12);
+    // Pulsing core
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x + 16), Math.round(this.y + 16),  8,  8);
+  }
+}
+
+// --- Stalker ---
+// 14×16, insectoid. 3 HP. 130 px/s. Charges far; strafes perpendicular when ≤50px.
+
+class Stalker extends Enemy {
+  constructor(x, y) {
+    super(x, y, 14, 16);
+    this.hp = 3; this.maxHp = 3;
+    this.speed = 130;
+    this.strafeDir   = Math.random() < 0.5 ? 1 : -1;
+    this.strafeTimer = 0.5 + Math.random() * 0.5;
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + 7, cy = this.y + 8;
+    const px = player.x + 4, py = player.y + 4;
+    const dx = px - cx, dy = py - cy;
+    const dist = Math.hypot(dx, dy) || 1;
+    this.iframes = Math.max(0, this.iframes - 1);
+    let mvx, mvy;
+    if (dist > 50) {
+      mvx = dx / dist; mvy = dy / dist;
+    } else {
+      this.strafeTimer -= dt;
+      if (this.strafeTimer <= 0) { this.strafeDir *= -1; this.strafeTimer = 0.5 + Math.random() * 0.5; }
+      mvx = (-dy / dist) * this.strafeDir;
+      mvy = ( dx / dist) * this.strafeDir;
+    }
+    this.x += mvx * this.speed * dt;
+    this.y += mvy * this.speed * dt;
+    for (const w of walls) resolveAABB(this, w);
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 4), 10, 12);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13];
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y),  8,  4);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[0];
+    ctx.fillRect(Math.round(this.x),      Math.round(this.y + 8), 2, 6);
+    ctx.fillRect(Math.round(this.x + 12), Math.round(this.y + 8), 2, 6);
+  }
+}
+
+// --- Spitter ---
+// 16×16, anchored. 4 HP. Stationary. Spits acid projectile every 1.2s.
+
+class Spitter extends Enemy {
+  constructor(x, y) {
+    super(x, y, 16, 16);
+    this.hp = 4; this.maxHp = 4;
+    this.spitTimer = 1.2 + Math.random() * 0.5;
+  }
+
+  update(dt, walls, player, bullets) {
+    this.iframes   = Math.max(0, this.iframes - 1);
+    this.spitTimer = Math.max(0, this.spitTimer - dt);
+    if (this.spitTimer === 0) {
+      const cx = this.x + 8, cy = this.y + 8;
+      const dx = player.x + 4 - cx, dy = player.y + 4 - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+      spitterSpits.push(new SpitterSpit(cx - 1, cy - 1, dx / dist * 80, dy / dist * 80));
+      this.spitTimer = 1.2;
+    }
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[9];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 16, 16);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[8];
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y + 2), 12, 12);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[12];
+    ctx.fillRect(Math.round(this.x + 6), Math.round(this.y + 6),  4,  4);
+  }
+}
+
+// --- SpitterSpit ---
+class SpitterSpit {
+  constructor(x, y, vx, vy) {
+    this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.w = 3; this.h = 3; this.lifeTimer = 1.5; this.alive = true;
+  }
+  update(dt) {
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.lifeTimer -= dt;
+    if (overlaps(this, player)) { player.takeDamage(1); this.alive = false; return; }
+    if (this.lifeTimer <= 0 || this.x < 0 || this.x > W || this.y < 0 || this.y > H) {
+      acidPuddles.push(new AcidPuddle(this.x + 1, this.y + 1)); this.alive = false;
+    }
+  }
+  draw(ctx) {
+    ctx.fillStyle = PALETTE[9];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 3, 3);
+  }
+}
+
+// --- AcidPuddle ---
+class AcidPuddle {
+  constructor(cx, cy) {
+    this.x = cx - 12; this.y = cy - 12; this.w = 24; this.h = 24;
+    this.timer = 2; this.dmgTimer = 0; this.alive = true;
+  }
+  update(dt) {
+    this.timer -= dt; this.dmgTimer = Math.max(0, this.dmgTimer - dt);
+    if (this.timer <= 0) { this.alive = false; return; }
+    if (overlaps(this, player) && this.dmgTimer === 0) { player.takeDamage(1); this.dmgTimer = 1; }
+  }
+  draw(ctx) {
+    ctx.globalAlpha = Math.min(0.5, this.timer / 2 * 0.5);
+    ctx.fillStyle   = PALETTE[9];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// --- Drifter ---
+// 12×12, floating. 2 HP. Passes through internal walls (only blocked by border).
+// Fires homing bullet every 2.5s.
+
+class Drifter extends Enemy {
+  constructor(x, y) {
+    super(x, y, 12, 12);
+    this.hp = 2; this.maxHp = 2;
+    this.speed = 60;
+    this.fireCooldown = 2 + Math.random();
+  }
+
+  update(dt, walls, player, bullets) {
+    const cx = this.x + 6, cy = this.y + 6;
+    const px = player.x + 4, py = player.y + 4;
+    const dx = px - cx, dy = py - cy;
+    const dist = Math.hypot(dx, dy) || 1;
+    this.iframes      = Math.max(0, this.iframes - 1);
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+    this.x += dx / dist * this.speed * dt;
+    this.y += dy / dist * this.speed * dt;
+    // Only border walls — passes through internal obstacles
+    for (const w of buildWalls(RoomManager.current.exits)) resolveAABB(this, w);
+    if (this.fireCooldown === 0) {
+      bullets.push(new Bullet(cx - 1, cy - 1, dx / dist * 90, dy / dist * 90, 1, 'enemy', 0, 60));
+      this.fireCooldown = 2.5;
+    }
+  }
+
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13];
+    ctx.fillRect(Math.round(this.x + 1), Math.round(this.y + 1), 10, 10);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x + 4), Math.round(this.y + 4),  4,  4);
+  }
+}
+
+// --- Shockwave ---
+class Shockwave {
+  constructor(cx, cy) {
+    this.x = cx - 24; this.y = cy - 4; this.w = 48; this.h = 8;
+    this.timer = 0.3; this._hit = false; this.alive = true;
+  }
+  update(dt) {
+    this.timer -= dt;
+    if (!this._hit && overlaps(this, player)) { player.takeDamage(1); this._hit = true; }
+    if (this.timer <= 0) this.alive = false;
+  }
+  draw(ctx) {
+    ctx.globalAlpha = Math.max(0, this.timer / 0.3);
+    ctx.fillStyle   = PALETTE[11];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// --- SweepBeam ---
+// Telegraphs 1s (red flashing line) then fires instant beam across full width.
+
+class SweepBeam {
+  constructor(y) {
+    this.y = y; this.x = 0; this.w = W; this.h = 6;
+    this.telegraphTimer = 1.0; this.active = false;
+    this.beamTimer = 0.15; this._hit = false; this.alive = true;
+  }
+  update(dt) {
+    if (!this.active) {
+      this.telegraphTimer -= dt;
+      if (this.telegraphTimer <= 0) this.active = true;
+    } else {
+      if (!this._hit && player.y + 8 > this.y - 3 && player.y < this.y + 9) {
+        player.takeDamage(1); this._hit = true;
+      }
+      this.beamTimer -= dt;
+      if (this.beamTimer <= 0) this.alive = false;
+    }
+  }
+  draw(ctx) {
+    if (!this.active) {
+      ctx.globalAlpha = 0.3 + Math.sin(Date.now() / 80) * 0.2;
+      ctx.fillStyle   = PALETTE[10];
+      ctx.fillRect(0, Math.round(this.y) - 1, W, 3);
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.globalAlpha = Math.max(0, this.beamTimer / 0.15);
+      ctx.fillStyle   = PALETTE[12];
+      ctx.fillRect(0, Math.round(this.y) - 2, W, 10);
+      ctx.fillStyle   = PALETTE[15];
+      ctx.fillRect(0, Math.round(this.y) + 1, W, 2);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+// --- PulsingPillar ---
+// Cycles grey → yellow telegraph → orange AoE damage every 2s.
+
+class PulsingPillar {
+  constructor(x, y) {
+    this.x = x; this.y = y; this.w = 16; this.h = 16;
+    this.cycleTimer = Math.random() * 2; // stagger instances
+    this._prevDangerous = false; this.alive = true;
+  }
+  update(dt) {
+    this.cycleTimer += dt;
+    const phase = this.cycleTimer % 2;
+    const dangerous = phase > 1.7;
+    if (dangerous && !this._prevDangerous && overlaps(this, player)) player.takeDamage(1);
+    this._prevDangerous = dangerous;
+  }
+  draw(ctx) {
+    const phase = this.cycleTimer % 2;
+    const dangerous = phase > 1.7;
+    ctx.fillStyle = dangerous ? PALETTE[11] : PALETTE[4];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+    if (!dangerous && phase > 1.4) {
+      ctx.globalAlpha = (phase - 1.4) / 0.3 * 0.5;
+      ctx.fillStyle   = PALETTE[12];
+      ctx.fillRect(Math.round(this.x), Math.round(this.y), this.w, this.h);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+
+// --- CoreGuardian (Boss) ---
+// Phase 1 (Armored): 20 HP. Lateral pace + stomp every 3s. 4 limbs cycle armored/exposed.
+//   Hit exposed limb 3× to break it. All 4 broken → phase 2.
+// Phase 2 (Enraged): 15 HP. 90 px/s. Sweep beam every 4s. Summons 2 Stalkers at ≤5 HP.
+
+class CoreGuardian extends Enemy {
+  constructor(x, y) {
+    super(x, y, 48, 48);
+    this.hp = 20; this.maxHp = 20;
+    this.phase = 1; this.speed = 40; this.dir = 1;
+    this.limbs = [
+      { dx: 0,   dy: -24, armored: true, hp: 3, broken: false, timer: 0   },
+      { dx: 0,   dy:  30, armored: true, hp: 3, broken: false, timer: 0.5 },
+      { dx: -24, dy:   4, armored: true, hp: 3, broken: false, timer: 1.0 },
+      { dx:  28, dy:   4, armored: true, hp: 3, broken: false, timer: 1.5 }
+    ];
+    this.stompTimer     = 3;
+    this.stompTelegraph = 0;
+    this.sweepTimer     = 4;
+    this._stalkerSpawned = false;
+  }
+
+  processLimbHit(bullet) {
+    const bcx = this.x + 24, bcy = this.y + 24;
+    for (const l of this.limbs) {
+      if (l.broken || l.armored) continue;
+      const lhb = { x: bcx + l.dx - 5, y: bcy + l.dy - 5, w: 10, h: 10 };
+      if (overlaps(bullet, lhb)) {
+        l.hp--;
+        if (l.hp <= 0) { l.broken = true; Sfx.enemyDie(); }
+        else Sfx.enemyHit();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  takeDamage(dmg) {
+    if (this.phase === 1) return;
+    if (this.iframes > 0) return;
+    this.hp -= dmg; this.iframes = 8;
+    if (this.hp <= 0) { this.alive = false; Sfx.enemyDie(); }
+    else Sfx.enemyHit();
+  }
+
+  update(dt, walls, player, bullets) {
+    this.iframes = Math.max(0, this.iframes - 1);
+
+    if (this.phase === 1) {
+      for (const l of this.limbs) {
+        if (!l.broken) { l.timer += dt; l.armored = l.timer % 2 < 1; }
+      }
+      // Lateral pace — bounce on wall contact
+      const prevX = this.x;
+      this.x += this.dir * this.speed * dt;
+      for (const w of walls) resolveAABB(this, w);
+      if (Math.abs(this.x - prevX) < this.speed * dt * 0.5) this.dir *= -1;
+      // Stomp
+      this.stompTimer -= dt;
+      if (this.stompTimer <= 0.5) this.stompTelegraph = Math.min(0.5, this.stompTelegraph + dt);
+      if (this.stompTimer <= 0) {
+        shockwaves.push(new Shockwave(this.x + 24, this.y + 44));
+        this.stompTimer = 3; this.stompTelegraph = 0;
+      }
+      if (this.limbs.every(l => l.broken)) {
+        this.phase = 2; this.hp = 15; this.maxHp = 15; this.speed = 90; this.sweepTimer = 4;
+        Sfx.bossTransition();
+      }
+    } else {
+      const cx = this.x + 24, cy = this.y + 24;
+      const px = player.x + 4, py = player.y + 4;
+      const dist = Math.hypot(cx - px, cy - py) || 1;
+      const s = this.speed * dt / dist;
+      this.x += (px - cx) * s; this.y += (py - cy) * s;
+      for (const w of walls) resolveAABB(this, w);
+      this.sweepTimer -= dt;
+      if (this.sweepTimer <= 0) { sweepBeams.push(new SweepBeam(this.y + 24)); this.sweepTimer = 4; }
+      if (this.hp <= 5 && !this._stalkerSpawned) {
+        enemies.push(new Stalker(this.x + 4,  H / 2));
+        enemies.push(new Stalker(this.x + 32, H / 2));
+        this._stalkerSpawned = true;
+      }
+    }
+  }
+
+  draw(ctx) {
+    const rx  = Math.round(this.x);
+    const yOff = this.stompTelegraph > 0.1 ? -4 : 0;
+    const ry  = Math.round(this.y) + yOff;
+    const fl  = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[4];
+    ctx.fillRect(rx + 4, ry + 4, 40, 40);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[5];
+    ctx.fillRect(rx + 8, ry + 8, 32, 32);
+    ctx.fillStyle = fl ? PALETTE[15] : (this.phase === 2 ? PALETTE[10] : PALETTE[2]);
+    ctx.fillRect(rx + 14, ry + 14, 20, 20);
+    if (this.phase === 1) {
+      const bcx = Math.round(this.x + 24), bcy = Math.round(this.y + 24) + yOff;
+      for (const l of this.limbs) {
+        if (l.broken) continue;
+        ctx.fillStyle = l.armored ? PALETTE[12] : PALETTE[10];
+        ctx.fillRect(bcx + l.dx - 5, bcy + l.dy - 5, 10, 10);
+      }
+    }
+  }
+}
+
+// --- Swarmer ---
+// 8×10, tiny alien. 1 HP. 140 px/s. Pure melee. Spawned in waves.
+
+class Swarmer extends Enemy {
+  constructor(x, y) {
+    super(x, y, 8, 10);
+    this.hp = 1; this.maxHp = 1;
+    this.speed = 140;
+  }
+  update(dt, walls, player, bullets) {
+    const cx = this.x + 4, cy = this.y + 5;
+    const px = player.x + 4, py = player.y + 4;
+    const dist = Math.hypot(cx - px, cy - py) || 1;
+    this.iframes = Math.max(0, this.iframes - 1);
+    this.x += (px - cx) / dist * this.speed * dt;
+    this.y += (py - cy) / dist * this.speed * dt;
+    for (const w of walls) resolveAABB(this, w);
+  }
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x + 1), Math.round(this.y), 6, 10);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[13];
+    ctx.fillRect(Math.round(this.x + 2), Math.round(this.y), 4, 4);
+  }
+}
+
+// --- WaveSpawner ---
+// 12×12. 2 HP. Stationary. Emits one Swarmer every 1.5s while alive.
+
+class WaveSpawner extends Enemy {
+  constructor(x, y) {
+    super(x, y, 12, 12);
+    this.hp = 2; this.maxHp = 2;
+    this.spawnTimer = 1.5 + Math.random();
+    this.countsForClear = true;
+  }
+  update(dt, walls, player, bullets) {
+    this.iframes    = Math.max(0, this.iframes - 1);
+    this.spawnTimer = Math.max(0, this.spawnTimer - dt);
+    if (this.spawnTimer === 0) {
+      const ang = Math.random() * Math.PI * 2;
+      enemies.push(new Swarmer(this.x + 6 + Math.cos(ang) * 20, this.y + 6 + Math.sin(ang) * 20));
+      this.spawnTimer = 1.5;
+    }
+  }
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[14];
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 12, 12);
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[10];
+    ctx.fillRect(Math.round(this.x + 3), Math.round(this.y + 3), 6, 6);
+    ctx.fillStyle = PALETTE[15];
+    ctx.fillRect(Math.round(this.x + 5), Math.round(this.y + 5), 2, 2);
+  }
+}
+
+// --- Pursuer ---
+// 24×24, re-skinned Vessel. Invulnerable. Matches player base speed.
+// Appears in act 4 r07–r08. Can't be killed — player must outrun it.
+
+class Pursuer extends Enemy {
+  constructor(x, y) {
+    super(x, y, 24, 24);
+    this.hp = 999; this.maxHp = 999;
+    this.speed = 90;
+    this.countsForClear = false;
+  }
+  takeDamage() {} // invulnerable
+  update(dt, walls, player, bullets) {
+    const cx = this.x + 12, cy = this.y + 12;
+    const px = player.x + 4,  py = player.y + 4;
+    const dist = Math.hypot(cx - px, cy - py) || 1;
+    const s = this.speed * dt / dist;
+    this.x += (px - cx) * s; this.y += (py - cy) * s;
+    for (const w of walls) resolveAABB(this, w);
+  }
+  draw(ctx) {
+    const fl = this.iframes > 0 && Math.floor(this.iframes / 2) % 2 === 0;
+    ctx.fillStyle = fl ? PALETTE[15] : PALETTE[10]; // blood red
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 24, 24);
+    ctx.fillStyle = PALETTE[0];
+    ctx.fillRect(Math.round(this.x + 3),  Math.round(this.y + 5), 4, 3);
+    ctx.fillRect(Math.round(this.x + 17), Math.round(this.y + 5), 4, 3);
+    ctx.fillStyle = PALETTE[11]; // orange eyes
+    ctx.fillRect(Math.round(this.x + 4),  Math.round(this.y + 6), 2, 1);
+    ctx.fillRect(Math.round(this.x + 18), Math.round(this.y + 6), 2, 1);
+  }
+}
+
+// --- Particle ---
+class Particle {
+  constructor(x, y, vx, vy, color, life) {
+    this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+    this.color = color; this.life = life; this.maxLife = life; this.alive = true;
+  }
+  update(dt) {
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.vy += 80 * dt; // gravity
+    this.life -= dt;
+    if (this.life <= 0) this.alive = false;
+  }
+  draw(ctx) {
+    ctx.globalAlpha = Math.max(0, this.life / this.maxLife);
+    ctx.fillStyle   = this.color;
+    ctx.fillRect(Math.round(this.x), Math.round(this.y), 2, 2);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function spawnHitSparks(x, y) {
+  const n = 4 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 30 + Math.random() * 60;
+    particles.push(new Particle(x, y, Math.cos(a)*s, Math.sin(a)*s, PALETTE[15], 0.2));
+  }
+}
+
+function spawnDeathBurst(x, y) {
+  const n = 12 + Math.floor(Math.random() * 5);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 40 + Math.random() * 80;
+    const c = PALETTE[10 + Math.floor(Math.random() * 3)]; // red/orange/yellow
+    particles.push(new Particle(x, y, Math.cos(a)*s, Math.sin(a)*s, c, 0.5));
+  }
+}
+
+function spawnDust(x, y) {
+  const n = 2 + Math.floor(Math.random() * 2);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 15 + Math.random() * 25;
+    particles.push(new Particle(x, y, Math.cos(a)*s, Math.sin(a)*s, PALETTE[4], 0.15));
+  }
+}
+
+// ===== 7. ROOM MANAGER =====
+
+const RoomManager = {
+  current: null,
+
+  load(id) {
+    this.current = ROOMS[id];
+  },
+
+  // Base walls + red barrier rects when exits are locked.
+  activeWalls() {
+    const r  = this.current;
+    const aw = [...r.walls];
+    if (r.lockExitsUntilCleared && !r.cleared) {
+      const DS = DOOR_SIZE;
+      if (r.exits.n) aw.push({ x: W/2 - DS/2, y: 0,      w: DS, h: BW,  barrier: true });
+      if (r.exits.s) aw.push({ x: W/2 - DS/2, y: H - BW, w: DS, h: BW,  barrier: true });
+      if (r.exits.e) aw.push({ x: W - BW,     y: H/2 - DS/2, w: BW, h: DS, barrier: true });
+      if (r.exits.w) aw.push({ x: 0,          y: H/2 - DS/2, w: BW, h: DS, barrier: true });
+    }
+    return aw;
+  },
+
+  draw(ctx) {
+    const r = this.current;
+    if (!r) return;
+    ctx.fillStyle = r.bgColor || PALETTE[0];
+    ctx.fillRect(0, 0, W, H);
+    for (const w of this.activeWalls()) {
+      ctx.fillStyle = w.barrier ? PALETTE[10] : PALETTE[4];
+      ctx.fillRect(w.x, w.y, w.w, w.h);
+    }
+    // Act 4: red emergency lighting overlay
+    if (r.act === 4) {
+      ctx.globalAlpha = 0.18 + Math.sin(Date.now() / 400) * 0.04;
+      ctx.fillStyle   = PALETTE[10];
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+};
+
+// ===== 8. GAME LOOP =====
+
+// 100 ms black flash between rooms.
+const Transition = {
+  active: false, timer: 0,
+  _room: null, _sx: 0, _sy: 0,
+
+  start(roomId, sx, sy) {
+    this.active = true;
+    this.timer  = 0.1;
+    this._room  = roomId;
+    this._sx    = sx;
+    this._sy    = sy;
+  },
+
+  update(dt) {
+    if (!this.active) return;
+    this.timer -= dt;
+    if (this.timer <= 0) {
+      this.active = false;
+      const prevAct = RoomManager.current ? RoomManager.current.act : 0;
+      RoomManager.load(this._room);
+      spawnEnemies(RoomManager.current);
+      spawnPickups(RoomManager.current);
+      if (RoomManager.current.act !== prevAct) Sfx.startAmbient(RoomManager.current.act);
+      player.x    = this._sx;
+      player.y    = this._sy;
+      bullets      = []; beams = []; grenadeList = [];
+      spitterSpits = []; acidPuddles = [];
+      shockwaves   = []; sweepBeams  = [];
+      particles    = [];
+    }
+  }
+};
+
+let gameState   = STATE.MENU;
+let player;
+let bullets     = [];
+let enemies     = [];
+let livePickups = [];
+let beams       = [];
+let grenadeList = [];
+let sporeClouds  = [];
+let spitterSpits = [];
+let escapeTimer   = 180;
+let dyingTimer    = 0;
+let deathCount    = 0;
+let gameStartTime = Date.now();
+let particles     = [];
+let hitShake      = 0;
+let acidPuddles  = [];
+let shockwaves   = [];
+let sweepBeams   = [];
+let pulsePillars = [];
+let acc          = 0;
+let lastTs      = 0;
+
+function spawnPickups(room) {
+  livePickups = room.pickups.map(p => new Pickup(p.type, p.x, p.y));
+}
+
+function spawnEnemies(room) {
+  // Clear all transient entity arrays before populating the new room.
+  enemies = []; sporeClouds = []; spitterSpits = []; acidPuddles = [];
+  shockwaves = []; sweepBeams = []; pulsePillars = [];
+
+  for (const e of room.enemies) {
+    switch (e.type) {
+      case 'grunt':         enemies.push(new Grunt(e.x, e.y));          break;
+      case 'sergeant':      enemies.push(new Sergeant(e.x, e.y));       break;
+      case 'twitchy':       enemies.push(new Twitchy(e.x, e.y));        break;
+      case 'hayes_boss':    enemies.push(new GeneralHayes(e.x, e.y));   break;
+      case 'hybrid':        enemies.push(new HybridSoldier(e.x, e.y));  break;
+      case 'alien_grunt':   enemies.push(new AlienGrunt(e.x, e.y));     break;
+      case 'spore_drone':   enemies.push(new SporeDrone(e.x, e.y));     break;
+      case 'brood_mother': {
+        const bm = new BroodMother(e.x, e.y);
+        enemies.push(bm); bm._spawnNodes(); break;
+      }
+      case 'stalker':       enemies.push(new Stalker(e.x, e.y));        break;
+      case 'spitter':       enemies.push(new Spitter(e.x, e.y));        break;
+      case 'drifter':       enemies.push(new Drifter(e.x, e.y));        break;
+      case 'core_guardian': enemies.push(new CoreGuardian(e.x, e.y));   break;
+      case 'pulse_pillar':  pulsePillars.push(new PulsingPillar(e.x, e.y)); break;
+      case 'swarmer':       enemies.push(new Swarmer(e.x, e.y));        break;
+      case 'spawner':       enemies.push(new WaveSpawner(e.x, e.y));    break;
+      case 'pursuer':       enemies.push(new Pursuer(e.x, e.y));        break;
+    }
+  }
+}
+
+function checkTransition(room) {
+  if (Transition.active) return;
+  if (room.lockExitsUntilCleared && !room.cleared) return;
+
+  const DS = DOOR_SIZE;
+  const px = player.x, py = player.y, pw = player.w, ph = player.h;
+  const pcx = px + pw / 2, pcy = py + ph / 2;
+
+  // Player just past the inner face of each border wall
+  if (room.exits.e && px + pw >= W - BW + 1 && pcy >= H/2 - DS/2 && pcy <= H/2 + DS/2) {
+    Transition.start(room.exits.e, BW + 16, H/2 - ph/2);
+  } else if (room.exits.w && px <= BW - 1 && pcy >= H/2 - DS/2 && pcy <= H/2 + DS/2) {
+    Transition.start(room.exits.w, W - BW - 16 - pw, H/2 - ph/2);
+  } else if (room.exits.s && py + ph >= H - BW + 1 && pcx >= W/2 - DS/2 && pcx <= W/2 + DS/2) {
+    Transition.start(room.exits.s, W/2 - pw/2, BW + 16);
+  } else if (room.exits.n && py <= BW - 1 && pcx >= W/2 - DS/2 && pcx <= W/2 + DS/2) {
+    Transition.start(room.exits.n, W/2 - pw/2, H - BW - 16 - ph);
+  }
+}
+
+// Restart from a given room (full state reset).
+function restartFrom(roomId) {
+  player.hp = player.maxHp;
+  player.weapons   = [{ name: 'PULSE', dmg: 1, rate: 4, speed: 240, ammo: Infinity, maxAmmo: Infinity }];
+  player.weaponIdx = 0; player.fireCooldown = 0; player.grenades = 1;
+  RoomManager.load(roomId);
+  spawnEnemies(RoomManager.current); spawnPickups(RoomManager.current);
+  player.x = W/2 - 4; player.y = H/2 - 4;
+  bullets = []; beams = []; grenadeList = [];
+  spitterSpits = []; acidPuddles = []; shockwaves = []; sweepBeams = [];
+  particles = []; hitShake = 0;
+  if (RoomManager.current.act === 4) escapeTimer = 180;
+  Sfx.startAmbient(RoomManager.current.act);
+  gameState = STATE.PLAYING;
+}
+
+const ACT_START = { 1:'act1_r01', 2:'act2_r01', 3:'act3_r01', 4:'act4_r01' };
+
+function update(dt) {
+  // MENU → start game on any key
+  if (gameState === STATE.MENU) {
+    if (Input._justDown.size > 0) {
+      Input._justDown.clear();
+      gameState = STATE.PLAYING;
+      Sfx.startAmbient(1);
+    }
+    return;
+  }
+
+  // WIN / LOSE / DYING input handling
+  if (gameState === STATE.WIN || gameState === STATE.LOSE) {
+    if (Input.consumePressed('KeyR')) {
+      deathCount = 0; gameStartTime = Date.now();
+      restartFrom(gameState === STATE.WIN ? 'act1_r01' : ACT_START[RoomManager.current.act]);
+    }
+    return;
+  }
+  if (gameState === STATE.DYING) {
+    dyingTimer -= dt;
+    if (dyingTimer <= 0) restartFrom(ACT_START[RoomManager.current.act] || 'act1_r01');
+    return;
+  }
+
+  Transition.update(dt);
+  if (Transition.active || gameState !== STATE.PLAYING) return;
+
+  const room  = RoomManager.current;
+  const walls = RoomManager.activeWalls();
+
+  player.update(dt, walls, bullets);
+
+  for (const e of enemies) {
+    if (e.alive) e.update(dt, walls, player, bullets);
+  }
+
+  // Knockback (applied after normal movement so it's additive, not overridden)
+  for (const e of enemies) {
+    if (e.kbTimer > 0) {
+      e.x += e.kbVx * dt; e.y += e.kbVy * dt;
+      for (const w of walls) resolveAABB(e, w);
+      e.kbVx *= 0.88; e.kbVy *= 0.88;
+      e.kbTimer = Math.max(0, e.kbTimer - dt);
+    }
+  }
+
+  for (const b of bullets) b.update(dt);
+  for (const bm of beams)  bm.update(dt);
+  for (const g of grenadeList) g.update(dt, walls);
+
+  // Player bullets → enemies (pierce-aware; CoreGuardian uses limb hitboxes)
+  for (const b of bullets) {
+    if (!b.alive || b.owner !== 'player') continue;
+    for (const e of enemies) {
+      if (!e.alive || b.hitSet.has(e)) continue;
+      if (e instanceof CoreGuardian && e.phase === 1) {
+        if (overlaps(b, e) && e.processLimbHit(b)) { b.alive = false; break; }
+      } else if (overlaps(b, e)) {
+        b.hitSet.add(e);
+        e.takeDamage(b.dmg);
+        if (b.pierce > 0) { b.pierce--; }
+        else { b.alive = false; break; }
+      }
+    }
+  }
+
+  // Enemy bullets → player
+  for (const b of bullets) {
+    if (!b.alive || b.owner !== 'enemy') continue;
+    if (overlaps(b, player)) { b.alive = false; player.takeDamage(b.dmg); }
+  }
+
+  // Enemy contact → player
+  for (const e of enemies) {
+    if (e.alive && overlaps(e, player)) player.takeDamage(1);
+  }
+
+  // Pickups → player
+  for (const p of livePickups) {
+    if (p.alive && overlaps(p, player)) collectPickup(p);
+  }
+
+  bullets     = bullets.filter(b => b.alive);
+  enemies     = enemies.filter(e => e.alive);
+  beams       = beams.filter(b => b.alive);
+  grenadeList = grenadeList.filter(g => g.alive);
+  livePickups = livePickups.filter(p => p.alive);
+
+  // Bullet-wall dust
+  for (const b of bullets) {
+    if (!b.alive) continue;
+    for (const w of walls) {
+      if (overlaps(b, w)) { b.alive = false; spawnDust(b.x, b.y); break; }
+    }
+  }
+
+  // Particles + hit-shake decay
+  for (const p of particles) p.update(dt);
+  particles = particles.filter(p => p.alive);
+  hitShake  = Math.max(0, hitShake - dt * 12);
+
+  // Act 3 hazards
+  for (const sc of sporeClouds)  sc.update(dt);
+  for (const ss of spitterSpits) ss.update(dt);
+  for (const ap of acidPuddles)  ap.update(dt);
+  for (const sw of shockwaves)   sw.update(dt);
+  for (const sb of sweepBeams)   sb.update(dt);
+  for (const pp of pulsePillars) pp.update(dt);
+
+  sporeClouds  = sporeClouds.filter(s => s.alive);
+  spitterSpits = spitterSpits.filter(s => s.alive);
+  acidPuddles  = acidPuddles.filter(a => a.alive);
+  shockwaves   = shockwaves.filter(s => s.alive);
+  sweepBeams   = sweepBeams.filter(s => s.alive);
+
+  // Room cleared? (Pursuers excluded from count)
+  const clearCount = enemies.filter(e => e.countsForClear !== false).length;
+  if (!room.cleared && clearCount === 0) {
+    room.cleared = true;
+    if (room.lockExitsUntilCleared) Sfx.doorOpen();
+  }
+
+  // Player death
+  if (player.hp <= 0) {
+    gameState  = STATE.DYING;
+    dyingTimer = 1.5;
+    deathCount++;
+  }
+
+  // Act 4 escape timer
+  if (room.act === 4) {
+    escapeTimer -= dt;
+    if (escapeTimer <= 0) { escapeTimer = 0; gameState = STATE.LOSE; }
+  }
+
+  // Win condition: east edge of act4_r08
+  if (room.id === 'act4_r08' && player.x + player.w >= W - BW - 4) {
+    gameState = STATE.WIN;
+  }
+
+  checkTransition(room);
+}
+
+function render(ctx) {
+  if (Transition.active) { ctx.fillStyle = PALETTE[0]; ctx.fillRect(0, 0, W, H); return; }
+
+  if (gameState === STATE.DYING) {
+    RoomManager.draw(ctx); player.draw(ctx);
+    const f = dyingTimer / 1.5;
+    ctx.globalAlpha = f > 0.8 ? (1 - f) * 5 : 1 - f / 0.8;
+    ctx.fillStyle   = f > 0.8 ? PALETTE[10] : PALETTE[0];
+    ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+    if (f < 0.5) {
+      ctx.fillStyle = PALETTE[5]; ctx.font = '8px monospace'; ctx.textAlign = 'center';
+      ctx.fillText('RESTARTING ACT ' + RoomManager.current.act, W/2, H/2);
+      ctx.textAlign = 'left';
+    }
+    return;
+  }
+
+  if (gameState === STATE.MENU) {
+    ctx.fillStyle = PALETTE[0]; ctx.fillRect(0, 0, W, H);
+    ctx.font = '8px monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = PALETTE[12];
+    ctx.fillText('H O S T F A L L', W/2, H/2 - 28);
+    ctx.fillStyle = PALETTE[4];
+    ctx.fillText('retro sci-fi action', W/2, H/2 - 14);
+    ctx.fillStyle = PALETTE[5];
+    if (Math.floor(Date.now() / 600) % 2 === 0)
+      ctx.fillText('PRESS ANY KEY TO START', W/2, H/2 + 8);
+    ctx.fillStyle = PALETTE[1];
+    ctx.fillText('WASD move  ARROWS aim/fire  TAB weapon  SPACE grenade', W/2, H/2 + 26);
+    ctx.textAlign = 'left'; return;
+  }
+
+  if (gameState === STATE.WIN) {
+    ctx.fillStyle = PALETTE[0]; ctx.fillRect(0, 0, W, H);
+    ctx.font = '8px monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = PALETTE[12];
+    ctx.fillText('EXTRACTION SUCCESSFUL', W/2, H/2 - 24);
+    ctx.fillStyle = PALETTE[5];
+    const elapsed = Math.round((Date.now() - gameStartTime) / 1000);
+    const m = Math.floor(elapsed/60), s = elapsed%60;
+    ctx.fillText('TIME  ' + m + ':' + String(s).padStart(2,'0'), W/2, H/2 - 8);
+    ctx.fillText('DEATHS  ' + deathCount, W/2, H/2 + 6);
+    ctx.fillStyle = PALETTE[4];
+    ctx.fillText('PRESS R TO RESTART', W/2, H/2 + 22);
+    ctx.textAlign = 'left'; return;
+  }
+
+  if (gameState === STATE.LOSE) {
+    ctx.fillStyle = PALETTE[0]; ctx.fillRect(0, 0, W, H);
+    ctx.font = '8px monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = PALETTE[10]; ctx.fillText('TOO LATE', W/2, H/2 - 8);
+    ctx.fillStyle = PALETTE[4]; ctx.fillText('PRESS R TO RESTART ACT', W/2, H/2 + 8);
+    ctx.textAlign = 'left'; return;
+  }
+
+  RoomManager.draw(ctx);
+  for (const ap of acidPuddles)  ap.draw(ctx);
+  for (const sc of sporeClouds)  sc.draw(ctx);
+  for (const pp of pulsePillars) pp.draw(ctx);
+  for (const p of livePickups)   p.draw(ctx);
+  for (const e of enemies)      e.draw(ctx);
+  for (const g of grenadeList) g.draw(ctx);
+  for (const b of bullets)     b.draw(ctx);
+  for (const bm of beams)        bm.draw(ctx);
+  for (const ss of spitterSpits) ss.draw(ctx);
+  for (const p  of particles)     p.draw(ctx);
+  for (const sw of shockwaves)   sw.draw(ctx);
+  for (const sb of sweepBeams)   sb.draw(ctx);
+  player.draw(ctx);
+  drawHUD(ctx);
+}
+
+function loop(ts) {
+  requestAnimationFrame(loop);
+  acc   += Math.min((ts - lastTs) / 1000, 0.05); // cap spike at 50 ms
+  lastTs = ts;
+  while (acc >= DT) { update(DT); acc -= DT; }
+  offCtx.clearRect(0, 0, W, H);
+  render(offCtx);
+  displayCtx.clearRect(0, 0, display.width, display.height);
+  // Screen shake (hit + act 4 escape pressure)
+  let shakeAmt = hitShake;
+  if (RoomManager.current && RoomManager.current.act === 4 && gameState === STATE.PLAYING) {
+    shakeAmt += escapeTimer < 30 ? 4 : escapeTimer < 90 ? 2 : 0;
+  }
+  const sx = shakeAmt ? (Math.random() - 0.5) * shakeAmt * 2 : 0;
+  const sy = shakeAmt ? (Math.random() - 0.5) * shakeAmt * 2 : 0;
+  displayCtx.drawImage(offscreen, Math.round(sx), Math.round(sy), display.width, display.height);
+}
+
+// ===== 9. UI / HUD =====
+
+function drawHUD(ctx) {
+  ctx.font = '8px monospace';
+
+  // --- Health pips (top-left) ---
+  // Active pip: blood-red filled square. Lost pip: dark navy outline.
+  for (let i = 0; i < player.maxHp; i++) {
+    if (i < player.hp) {
+      ctx.fillStyle = PALETTE[10];
+      ctx.fillRect(8 + i * 11, 6, 8, 8);
+    } else {
+      ctx.fillStyle = PALETTE[1];
+      ctx.fillRect(8 + i * 11, 6, 8, 8);
+      ctx.fillStyle = PALETTE[0];
+      ctx.fillRect(9 + i * 11, 7, 6, 6); // hollow centre
+    }
+  }
+
+  // --- Weapon name + ammo (top-right) ---
+  const wep     = player.weapons[player.weaponIdx];
+  const ammoStr = wep.ammo === Infinity ? '∞' : String(wep.ammo).padStart(3, ' ');
+  ctx.fillStyle = PALETTE[5];
+  ctx.textAlign = 'right';
+  ctx.fillText(wep.name + '  ' + ammoStr, W - 8, 15);
+  ctx.textAlign = 'left';
+
+  // --- Grenade count (bottom-left) ---
+  // Small orange square icon + count
+  ctx.fillStyle = PALETTE[11];
+  ctx.fillRect(8, H - 16, 6, 8);       // grenade icon
+  ctx.fillStyle = PALETTE[5];
+  ctx.fillText('×' + player.grenades, 17, H - 9);
+
+  // --- Stamina bar (bottom-right, only when not full) ---
+  if (player.sprinting || player.stamina < player.staminaMax) {
+    const bW = 40, bH = 4;
+    const bX = W - 8 - bW, bY = H - 10;
+    ctx.fillStyle = PALETTE[0];
+    ctx.fillRect(bX - 1, bY - 1, bW + 2, bH + 2);
+    ctx.fillStyle = PALETTE[2];
+    ctx.fillRect(bX, bY, bW, bH);
+    ctx.fillStyle = player.sprinting ? PALETTE[12] : PALETTE[9];
+    ctx.fillRect(bX, bY, Math.round(bW * player.stamina / player.staminaMax), bH);
+  }
+
+  // --- Act 4 escape timer (top-center) ---
+  if (RoomManager.current && RoomManager.current.act === 4 && gameState === STATE.PLAYING) {
+    const t   = Math.max(0, escapeTimer);
+    const m   = Math.floor(t / 60), s = Math.floor(t % 60);
+    const str = m + ':' + String(s).padStart(2, '0');
+    ctx.fillStyle = t < 30 ? PALETTE[10] : t < 90 ? PALETTE[11] : PALETTE[5];
+    ctx.textAlign = 'center';
+    ctx.fillText(str, W / 2, 15);
+    ctx.textAlign = 'left';
+  }
+
+  // --- Boss bar + dialogue (when a boss is present) ---
+  const boss = enemies.find(e => e instanceof GeneralHayes || e instanceof BroodMother || e instanceof CoreGuardian);
+  if (boss) {
+    const bW = 140, bH = 7;
+    const bX = W / 2 - bW / 2, bY = 20;
+    let label, barColor;
+    if (boss instanceof GeneralHayes) {
+      label    = boss.phase === 1 ? 'GENERAL HAYES' : 'THE VESSEL';
+      barColor = boss.phase === 1 ? PALETTE[10] : PALETTE[13];
+    } else if (boss instanceof BroodMother) {
+      label    = boss.vulnerable ? 'BROOD MOTHER  [VULNERABLE]' : 'BROOD MOTHER';
+      barColor = boss.vulnerable ? PALETTE[10] : PALETTE[4];
+    } else {
+      label    = boss.phase === 1 ? 'CORE GUARDIAN' : 'ENRAGED GUARDIAN';
+      barColor = boss.phase === 1 ? PALETTE[4] : PALETTE[10];
+    }
+    ctx.fillStyle = PALETTE[5];
+    ctx.textAlign = 'center';
+    ctx.fillText(label, W / 2, bY - 2);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = PALETTE[1];
+    ctx.fillRect(bX, bY, bW, bH);
+    ctx.fillStyle = barColor;
+    ctx.fillRect(bX, bY, Math.round(bW * Math.max(0, boss.hp) / boss.maxHp), bH);
+    // Dialogue overlay
+    if (boss.dialogueText && boss.dialogueTimer > 0) {
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(16, H / 2 - 10, W - 32, 18);
+      ctx.fillStyle = PALETTE[5];
+      ctx.textAlign = 'center';
+      ctx.fillText('"' + boss.dialogueText + '"', W / 2, H / 2 + 4);
+      ctx.textAlign = 'left';
+    }
+  }
+}
+
+// ===== 10. BOOTSTRAP =====
+
+const display    = document.getElementById('display');
+const displayCtx = display.getContext('2d');
+
+const offscreen  = document.createElement('canvas');
+offscreen.width  = W;
+offscreen.height = H;
+const offCtx = offscreen.getContext('2d');
+offCtx.imageSmoothingEnabled = false;
+
+function resize() {
+  const s = Math.max(1, Math.min(
+    Math.floor(window.innerWidth  / W),
+    Math.floor(window.innerHeight / H)
+  ));
+  display.width  = W * s;
+  display.height = H * s;
+  displayCtx.imageSmoothingEnabled = false;
+}
+
+resize();
+window.addEventListener('resize', resize);
+Input.init();
+RoomManager.load('act1_r01');
+spawnEnemies(RoomManager.current);
+spawnPickups(RoomManager.current);
+player = new Player(W / 2 - 4, H / 2 - 4);
+requestAnimationFrame(ts => { lastTs = ts; requestAnimationFrame(loop); });
+
+</script>
+</body>
+</html>
